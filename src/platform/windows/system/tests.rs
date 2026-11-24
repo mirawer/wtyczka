@@ -186,12 +186,15 @@ async fn ipc_round_trip_keeps_a_private_instance_alive() -> Result<()> {
             .await
             .is_err()
     );
-    for _ in 0..3 {
+    for turn in 0..3 {
         let (server, client) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(listener.accept(), connect(&runtime))
         })
         .await?;
-        let (mut server, mut client) = (server?, client?);
+        let (mut server, mut client) = (
+            server.with_context(|| format!("Accept control connection {turn}"))?,
+            client.with_context(|| format!("Connect control client {turn}"))?,
+        );
         assert!(Listener::bind(&runtime).is_err());
         // Even with an accepted connection alive, a new FIRST instance cannot
         // squat, and a pending replacement is ready before this stream is used.
@@ -206,7 +209,28 @@ async fn ipc_round_trip_keeps_a_private_instance_alive() -> Result<()> {
         assert_eq!(&output, b"ok\n");
     }
     drop(listener);
-    let listener = Listener::bind(&runtime)?;
+    // Mio cancels overlapped reads on Drop, but their IOCP completions still
+    // retain the OS handles until the Tokio driver runs. A synchronous rebind
+    // here cannot assume that every old instance has already been closed.
+    let listener = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match Listener::bind(&runtime) {
+                Ok(listener) => return Ok(listener),
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<io::Error>()
+                            .is_some_and(|e| e.raw_os_error() == Some(5))
+                    }) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .context("Old pipe handles were not released after IOCP cleanup")??;
     drop(listener);
     Ok(())
 }
