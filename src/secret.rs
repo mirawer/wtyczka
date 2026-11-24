@@ -39,6 +39,41 @@ pub fn prompt_key(_label: &str) -> Result<Zeroizing<String>> {
     bail!("Hidden API key input is unsupported on this platform.")
 }
 
+/// The private child pipe is unbuffered while it contains a secret. A fixed
+/// capacity avoids reallocations; only the subsequent public JSON is buffered.
+pub(crate) async fn read_pipe_key(
+    input: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<Zeroizing<String>> {
+    use tokio::io::AsyncReadExt;
+    let mut key = Zeroizing::new(String::new());
+    key.try_reserve_exact(MAX_KEY_LEN)
+        .context("Cannot allocate API key buffer.")?;
+    let mut byte = Zeroizing::new([0u8; 1]);
+    let mut carriage_return = false;
+    loop {
+        if input
+            .read(&mut *byte)
+            .await
+            .context("Cannot read private startup pipe.")?
+            == 0
+        {
+            bail!("Private API key input ended before newline.");
+        }
+        match byte[0] {
+            b'\n' => {
+                crate::credentials::validate_key(&key)?;
+                return Ok(key);
+            }
+            b'\r' if !carriage_return => carriage_return = true,
+            b' '..=b'~' if !carriage_return && key.len() < MAX_KEY_LEN => {
+                key.push(char::from(byte[0]))
+            }
+            _ => bail!("Private API key input must be at most 4096 printable ASCII characters."),
+        }
+        byte.zeroize();
+    }
+}
+
 trait Console {
     /// A byte on Unix, or a UTF-16 code unit on Windows. Neither is decoded or
     /// included in errors; only printable ASCII is ever accepted.
@@ -215,6 +250,43 @@ mod tests {
             }
             self.output.push_str(text);
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn private_pipe_input_is_bounded_validated_and_leaves_public_json_unread() {
+        use tokio::io::AsyncReadExt;
+        for ending in ["\n", "\r\n"] {
+            let bytes = format!("synthetic-key{ending}public-json\n");
+            let mut input = bytes.as_bytes();
+            assert_eq!(
+                read_pipe_key(&mut input).await.unwrap().as_str(),
+                "synthetic-key"
+            );
+            let mut public = String::new();
+            input.read_to_string(&mut public).await.unwrap();
+            assert_eq!(public, "public-json\n");
+        }
+        let maximum = format!("{}\n", "x".repeat(MAX_KEY_LEN));
+        assert_eq!(
+            read_pipe_key(&mut maximum.as_bytes()).await.unwrap().len(),
+            MAX_KEY_LEN
+        );
+        for invalid in [
+            "\n".to_owned(),
+            "   \n".into(),
+            "private".into(),
+            "private\0\n".into(),
+            "private\rX\n".into(),
+            "privateé\n".into(),
+            format!("{}\n", "x".repeat(MAX_KEY_LEN + 1)),
+        ] {
+            let error = read_pipe_key(&mut invalid.as_bytes())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("privateé"));
+            assert!(!error.contains("private\0"));
         }
     }
 

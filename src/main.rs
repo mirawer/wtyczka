@@ -1,7 +1,10 @@
 mod answer;
 mod api;
+mod config;
+mod credentials;
 mod display;
 mod keybind;
+mod launch;
 mod mode;
 mod platform;
 mod secret;
@@ -14,15 +17,13 @@ use display::State;
 use mode::{AnswerMode, SelectionMode};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File},
+    fs::File,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::Command,
     time::timeout,
 };
 use zeroize::Zeroizing;
@@ -36,7 +37,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Katalog stanu (Linux: .runtime projektu; Windows: LocalAppData/ScreenAnswer)"
+        help = "Katalog stanu (Linux: .runtime projektu lub XDG_STATE_HOME/screen-answer; Windows: LocalAppData/ScreenAnswer)"
     )]
     runtime_dir: Option<PathBuf>,
     #[arg(long, value_enum)]
@@ -67,8 +68,20 @@ struct Cli {
         help = "Jedna lub wiele poprawnych odpowiedzi (normalnie wybierane w kreatorze)"
     )]
     selection: Option<SelectionMode>,
-    #[arg(long,default_value_t=60,value_parser=clap::value_parser!(u64).range(5..=300))]
-    timeout: u64,
+    #[arg(long, value_parser=clap::value_parser!(u64).range(5..=300), help = "Limit API w sekundach; domyślnie zapisany lub 60")]
+    timeout: Option<u64>,
+    #[arg(
+        long,
+        help = "Ponownie przejdź cały kreator i zastąp zapisaną konfigurację"
+    )]
+    change: bool,
+    #[arg(
+        long,
+        help = "Klucz tylko na tę sesję; nie zmieniaj istniejącej konfiguracji z zapisanym kluczem"
+    )]
+    session_only: bool,
+    #[arg(long, help = "Wyświetl licencję MIT i zakończ")]
+    license: bool,
     #[cfg(target_os = "linux")]
     #[arg(
         long,
@@ -87,6 +100,8 @@ enum Action {
     Trigger,
     /// Wstrzymaj/wznów analizę i wyczyść wynik do myślnika.
     TogglePause,
+    /// Zatrzymaj program, usuń zapisany klucz; pozostaw niesekretne ustawienia.
+    ForgetKey,
     /// Zakończ program i zwolnij skróty.
     Stop,
     /// Pokaż tylko stan procesu, nigdy odpowiedź modelu.
@@ -108,7 +123,7 @@ enum Action {
     Serve,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Settings {
     provider: Provider,
     model: String,
@@ -126,6 +141,12 @@ struct Settings {
 struct Startup {
     settings: Settings,
     timeout: u64,
+    #[serde(default)]
+    save_key: bool,
+    #[serde(default)]
+    preserve_saved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_id: Option<String>,
     // Preserve the existing Linux startup JSON (niri_config) while keeping it out of Windows.
     #[serde(flatten)]
     platform: platform::Startup,
@@ -148,16 +169,6 @@ fn prompt(label: &str) -> Result<String> {
     Ok(value.trim().to_owned())
 }
 
-fn read_settings(cli: &Cli, runtime: &Path) -> Result<Settings> {
-    let path = runtime.join("settings.json");
-    let saved: Option<Settings> = if path.exists() {
-        Some(serde_json::from_slice(&fs::read(path)?).context("Uszkodzony settings.json.")?)
-    } else {
-        None
-    };
-    setup::configure(cli, saved.as_ref(), &mut prompt, &mut io::stdout())
-}
-
 #[tokio::main]
 async fn main() {
     platform::initialize();
@@ -169,6 +180,13 @@ async fn main() {
 
 async fn entry() -> Result<()> {
     let cli = Cli::parse();
+    if cli.license {
+        print!("{}", include_str!("../LICENSE"));
+        return Ok(());
+    }
+    if cli.change && cli.command.is_some() {
+        bail!("Użyj --change bez dodatkowego polecenia.");
+    }
     let runtime = platform::prepare_runtime(
         &cli.runtime_dir
             .clone()
@@ -181,8 +199,11 @@ async fn entry() -> Result<()> {
         Some(Action::TogglePause) => {
             client(&runtime, "toggle-pause").await?;
         }
+        Some(Action::ForgetKey) => {
+            launch::forget_key(&runtime).await?;
+        }
         Some(Action::Stop) => {
-            client(&runtime, "stop").await?;
+            launch::stop(&runtime).await?;
             println!("Program zatrzymany; skróty zwolnione.");
         }
         Some(Action::Status) => match client(&runtime, "status").await {
@@ -219,156 +240,22 @@ async fn entry() -> Result<()> {
             ui.shutdown().await?;
         }
         Some(Action::Serve) => {
-            let mut reader = BufReader::new(tokio::io::stdin());
-            let mut key = Zeroizing::new(String::new());
-            reader.read_line(&mut key).await?;
-            while key.ends_with(['\r', '\n']) {
-                key.pop();
-            }
+            let mut input = tokio::io::stdin();
+            let key = secret::read_pipe_key(&mut input).await?;
+            // Only non-secret startup JSON enters a buffered reader.
+            let mut reader = BufReader::new(input).take(64 * 1024 + 1);
             let mut line = String::new();
-            reader.read_line(&mut line).await?;
-            let startup: Startup = serde_json::from_str(&line)?;
-            run(runtime, startup, key, true).await?;
+            let count = reader.read_line(&mut line).await?;
+            if count > 64 * 1024 || !line.ends_with('\n') {
+                bail!("Nieprawidłowe lub zbyt duże dane startowe.");
+            }
+            let startup: Startup = serde_json::from_str(&line)
+                .map_err(|_| anyhow::anyhow!("Nieprawidłowe dane startowe."))?;
+            run(runtime, startup, key, true, None).await?;
         }
-        None => start(cli, runtime).await?,
+        None => launch::start(cli, runtime).await?,
     }
     Ok(())
-}
-
-async fn start(cli: Cli, runtime: PathBuf) -> Result<()> {
-    drop(lock(&runtime)?);
-    let mut settings = read_settings(&cli, &runtime)?;
-    loop {
-        match platform::check_keybind_available(&settings.keybind).and_then(|()| {
-            platform::validate_keybind_pair(&settings.keybind, settings.pause_keybind.as_deref())
-        }) {
-            Ok(()) => break,
-            Err(error) => {
-                if cli.keybind.is_some() {
-                    return Err(error);
-                }
-                eprintln!("Nie można użyć wybranego skrótu: {error}");
-                loop {
-                    let input = prompt("Inny skrót [Ctrl+Shift+F8]: ")?;
-                    let input = if input.is_empty() {
-                        "Ctrl+Shift+F8"
-                    } else {
-                        &input
-                    };
-                    match keybind::normalize_keybind(input).and_then(|key| {
-                        platform::validate_keybind_pair(&key, settings.pause_keybind.as_deref())?;
-                        Ok(key)
-                    }) {
-                        Ok(key) => {
-                            settings.keybind = key;
-                            break;
-                        }
-                        Err(_) => eprintln!("Nieprawidłowy skrót. Wpisz np. Ctrl+Shift+F8."),
-                    }
-                }
-            }
-        }
-    }
-    while let Some(pause) = &settings.pause_keybind {
-        match platform::check_keybind_available(pause) {
-            Ok(()) => break,
-            Err(error) => {
-                if cli.pause_keybind.is_some() {
-                    return Err(error);
-                }
-                eprintln!("Nie można użyć skrótu pauzy: {error}");
-                loop {
-                    let input = prompt("Inny skrót pauzy [brak]: ")?;
-                    match setup::configured_pause_keybind(&input, &settings.keybind) {
-                        Ok(key) => {
-                            settings.pause_keybind = key;
-                            break;
-                        }
-                        Err(_) => eprintln!(
-                            "Nieprawidłowy lub powtórzony skrót. Wpisz np. Ctrl+Shift+F9 albo brak."
-                        ),
-                    }
-                }
-            }
-        }
-    }
-    let os_startup = platform::prepare_start(&cli, &runtime)?;
-    api::endpoint_url(settings.provider, &settings.model, &settings.base_url)?;
-    println!(
-        "Dostawca: {:?}; model: {}; adres: {}",
-        settings.provider, settings.model, settings.base_url
-    );
-    println!(
-        "Po skrócie {} cały aktywny monitor trafi do tego API. Klucz nie zostanie zapisany.",
-        settings.keybind
-    );
-    if settings.provider == Provider::Anthropic {
-        println!(
-            "Limit wyjścia Claude: {} tokenów łącznie na myślenie i odpowiedź. Tokeny myślenia również są płatne.",
-            api::ANTHROPIC_MAX_TOKENS
-        );
-    }
-    println!("Tryb odpowiedzi: {}.", settings.mode.description());
-    println!(
-        "Liczba poprawnych odpowiedzi: {}.",
-        settings.selection.description()
-    );
-    if let Some(pause) = &settings.pause_keybind {
-        println!("Pauza/wznowienie: {pause}. Pauza czyści wynik do myślnika (-).");
-    }
-    println!("\n7/7 — Teraz wklej klucz API. Wpisywane znaki nie będą widoczne.");
-    let key = loop {
-        match secret::prompt_key("Klucz API (ukryty): ") {
-            Ok(key) => break key,
-            Err(err) if err.is::<secret::InvalidKey>() => {
-                eprintln!("{err}\nSpróbuj ponownie. Wpisywane znaki pozostają ukryte.");
-            }
-            Err(err) => return Err(err),
-        }
-    };
-    let startup = Startup {
-        settings,
-        timeout: cli.timeout,
-        platform: os_startup,
-    };
-    if cli.foreground {
-        run(runtime, startup, key, false).await
-    } else {
-        let log = platform::open_private_file(&runtime.join("daemon.log"), true, false)?;
-        let mut command = Command::new(std::env::current_exe()?);
-        command
-            .arg("--runtime-dir")
-            .arg(&runtime)
-            .arg("serve")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(log));
-        platform::detach(&mut command);
-        let mut child = command
-            .spawn()
-            .context("Nie można uruchomić procesu w tle.")?;
-        let mut input = child.stdin.take().context("Brak stdin procesu.")?;
-        input.write_all(key.as_bytes()).await?;
-        input.write_all(b"\n").await?;
-        input
-            .write_all(serde_json::to_string(&startup)?.as_bytes())
-            .await?;
-        input.write_all(b"\n").await?;
-        drop(input);
-        let mut output = BufReader::new(child.stdout.take().context("Brak stdout procesu.")?);
-        let mut response = String::new();
-        let ready = timeout(Duration::from_secs(20), output.read_line(&mut response)).await;
-        if !matches!(ready, Ok(Ok(_))) || response.trim() != "READY" {
-            platform::terminate(&mut child).await;
-            let _ = timeout(Duration::from_secs(5), child.wait()).await;
-            bail!(
-                "Start nie powiódł się. Sprawdź {} (bez kluczy i treści odpowiedzi).",
-                runtime.join("daemon.log").display()
-            );
-        }
-        println!("Działa w tle. Odpowiedź tylko na pasku. Zatrzymanie: screen-answer stop");
-        Ok(())
-    }
 }
 
 async fn client(runtime: &Path, request: &str) -> Result<()> {
@@ -469,26 +356,40 @@ async fn apply_control(
     Ok(true)
 }
 
+async fn bind_listener(runtime: &Path) -> Result<platform::ipc::Listener> {
+    #[cfg(not(windows))]
+    {
+        platform::ipc::Listener::bind(runtime)
+    }
+    #[cfg(windows)]
+    {
+        // Cancelled named-pipe IO can retain its final handle until IOCP cleanup.
+        // We hold the worker lock, so bounded retries cannot create two workers.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match platform::ipc::Listener::bind(runtime) {
+                Ok(listener) => return Ok(listener),
+                Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+    }
+}
+
 async fn run(
     runtime: PathBuf,
     startup: Startup,
     key: Zeroizing<String>,
     detached: bool,
+    mut launcher_guard: Option<File>,
 ) -> Result<()> {
+    credentials::validate_key(&key)?;
+    setup::validate_saved(&startup.settings)?;
+    if !(5..=300).contains(&startup.timeout) {
+        bail!("Nieprawidłowy limit czasu analizy.");
+    }
     let _lock = lock(&runtime)?;
     platform::recover(&runtime)?;
-    let mut listener = platform::ipc::Listener::bind(&runtime)?;
-    let api = std::sync::Arc::new(
-        Api::new(
-            startup.settings.provider,
-            startup.settings.model.clone(),
-            &startup.settings.base_url,
-            key,
-            startup.timeout,
-        )?
-        .with_mode(startup.settings.mode)
-        .with_selection(startup.settings.selection),
-    );
     // Install Unix signal handlers before changing any compositor configuration.
     let mut shutdown = platform::shutdown_signal()?;
     let (controls_tx, mut controls_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -497,18 +398,50 @@ async fn run(
         .context("Nie można uruchomić wskaźnika lub zarejestrować skrótu.")?;
     let mut analysis = Analysis::default();
     let mut stop_client = None;
+    let mut pending_credential = None;
+    let mut committed = false;
+    let mut retired_cleanup = None;
     // Every error after native UI creation must await cleanup, not merely enqueue
     // it in Drop immediately before the process exits.
     let result: Result<()> = async {
-        fs::write(
-            runtime.join("settings.json"),
-            serde_json::to_vec_pretty(&startup.settings)?,
-        )?;
+        let mut credential_id = startup.credential_id.clone();
+        if startup.save_key {
+            let id = credentials::new_id()?;
+            // Track the ID before writing: even a lost create reply can be cleaned up.
+            pending_credential = Some(id.clone());
+            credentials::save(&runtime, &startup.settings, &id, &key).await?;
+            credential_id = Some(id);
+        }
+        let api = std::sync::Arc::new(Api::new(
+            startup.settings.provider, startup.settings.model.clone(),
+            &startup.settings.base_url, key, startup.timeout,
+        )?.with_mode(startup.settings.mode).with_selection(startup.settings.selection));
+        let mut listener = bind_listener(&runtime).await?;
+        let mut retired = if startup.preserve_saved { None } else { config::load(&runtime).ok().flatten() };
+        if let Some(previous) = &mut retired
+            && previous.credential_id != credential_id { previous.retire_active(); }
+        let retired_credentials = retired.map(|s| s.retired_credentials).unwrap_or_default();
+        if retired_credentials.len() + usize::from(credential_id.is_some()) > 32 { bail!("Zbyt wiele starych kluczy. Najpierw użyj forget-key."); }
+        let saved = config::Saved { settings: startup.settings.clone(), timeout: startup.timeout, credential_id, retired_credentials };
+        let mut transaction = if startup.preserve_saved { None } else { Some(config::Transaction::install(&runtime, &saved)?) };
+        // Discard presses received while the keyring/setup was still pending.
+        while controls_rx.try_recv().is_ok() {}
         if detached {
-            println!("READY");
-            io::stdout().flush()?;
+            let mut output = io::stdout();
+            writeln!(output, "READY")?;
+            output.flush()?;
         } else {
-            println!("Działa. Ctrl+C kończy program; odpowiedź jest wyłącznie na pasku.");
+            let mut output = io::stdout();
+            writeln!(output, "Działa. Ctrl+C kończy program; odpowiedź jest wyłącznie na pasku.")?;
+            output.flush()?;
+        }
+        if let Some(transaction) = &mut transaction { transaction.commit(); }
+        committed = true;
+        // Foreground operation must not keep the launcher lock for its lifetime.
+        drop(launcher_guard.take());
+        if !startup.preserve_saved && !saved.retired_credentials.is_empty() {
+            let runtime = runtime.clone();
+            retired_cleanup = Some(tokio::spawn(async move { config::cleanup_retired(&runtime, saved).await; }));
         }
         loop {
             tokio::select! {
@@ -536,6 +469,14 @@ async fn run(
                     if !matches!(received, Ok(Ok(_))) { continue; }
                     let command = std::str::from_utf8(&line).unwrap_or("").trim();
                     let mut stream = reader.into_inner();
+                    if command == "bindings" {
+                        // Reconfiguration may retain a different persistent setup;
+                        // disclose only actual shortcut names, never answers/keys.
+                        let mut bindings = serde_json::to_vec(&(&startup.settings.keybind, &startup.settings.pause_keybind))?;
+                        bindings.push(b'\n');
+                        let _ = stream.write_all(&bindings).await;
+                        continue;
+                    }
                     let response = match command {
                         "stop" => { stop_client = Some(stream); break; },
                         "status" => "OK\n",
@@ -554,7 +495,20 @@ async fn run(
         Ok(())
     }.await;
     analysis.cancel().await;
+    if !committed
+        && let Some(id) = pending_credential
+        && credentials::delete(&runtime, &startup.settings, &id)
+            .await
+            .is_err()
+    {
+        eprintln!(
+            "Nie udało się usunąć tymczasowego wpisu z magazynu poświadczeń po nieudanym starcie."
+        );
+    }
     let restored = ui.shutdown().await;
+    if let Some(cleanup) = retired_cleanup {
+        let _ = cleanup.await;
+    }
     if let Some(mut stream) = stop_client {
         let response: &[u8] = if restored.is_ok() {
             b"OK\n"

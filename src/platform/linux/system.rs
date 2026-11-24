@@ -13,9 +13,24 @@ pub fn default_runtime() -> PathBuf {
             .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("src/main.rs").is_file())
             .map(Path::to_path_buf)
     });
-    project
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-        .join(".runtime")
+    if let Some(project) = project {
+        return project.join(".runtime");
+    }
+    state_runtime(
+        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn state_runtime(state: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    state
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.filter(|path| path.is_absolute())
+                .map(|home| home.join(".local/state"))
+        })
+        .map(|base| base.join("screen-answer"))
+        .unwrap_or_else(|| PathBuf::from(".screen-answer-state"))
 }
 
 pub fn initialize() {
@@ -41,10 +56,17 @@ pub fn prepare_runtime(path: &Path) -> Result<PathBuf> {
         }
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     } else {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .context("Nie można utworzyć katalogów stanu.")?;
+        }
         fs::DirBuilder::new()
             .mode(0o700)
             .create(path)
-            .context("Nie można utworzyć katalogu stanu (katalog nadrzędny musi istnieć).")?;
+            .context("Nie można utworzyć katalogu stanu.")?;
     }
     fs::canonicalize(path).context("Nie można odczytać katalogu stanu.")
 }
@@ -96,5 +118,25 @@ impl Shutdown {
     pub async fn wait(&mut self) -> Result<()> {
         tokio::select! {_=self.term.recv()=>{},_=self.interrupt.recv()=>{}}
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn standalone_state_is_stable_and_does_not_use_ci_build_paths() {
+        assert_eq!(
+            state_runtime(Some("/state".into()), Some("/home/test".into())),
+            PathBuf::from("/state/screen-answer")
+        );
+        assert_eq!(
+            state_runtime(None, Some("/home/test".into())),
+            PathBuf::from("/home/test/.local/state/screen-answer")
+        );
+        assert_eq!(
+            state_runtime(Some("relative".into()), Some("/home/test".into())),
+            PathBuf::from("/home/test/.local/state/screen-answer")
+        );
     }
 }

@@ -182,7 +182,8 @@ def main():
             for p in fakebin.iterdir():
                 p.chmod(0o700)
             env = dict(os.environ, PATH=f'{fakebin}:{os.environ["PATH"]}', TEST_LOADED=str(loaded), TEST_CAPTURES=str(captures))
-            args = [str(BINARY), '--runtime-dir', str(runtime)]
+            # Explicit memory-only mode: this suite never accesses the user's keyring.
+            args = [str(BINARY), '--runtime-dir', str(runtime), '--session-only']
             startup = {'settings': {'provider': 'anthropic', 'model': 'test-model', 'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'keybind': 'Print'}, 'timeout': 5, 'niri_config': str(base)}
             proc = subprocess.Popen(args + ['serve'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
             try:
@@ -320,8 +321,9 @@ def main():
                     assert 'Działa w tle'.encode() in transcript, transcript
                     cli('status')
                     assert 'Ctrl+Shift+F8 repeat=false' in (runtime / 'niri-overlay.kdl').read_text()
-                    duplicate = subprocess.run(args, env=env, capture_output=True, timeout=5)
-                    assert duplicate.returncode != 0
+                    duplicate = subprocess.run([str(BINARY), '--runtime-dir', str(runtime)], env=env, capture_output=True, timeout=5)
+                    assert duplicate.returncode == 0
+                    assert 'już działa'.encode() in duplicate.stdout
                     assert b'Klucz API' not in duplicate.stdout
                     control = socket.socket(socket.AF_UNIX)
                     control.connect(str(runtime / 'control.sock'))
@@ -373,7 +375,7 @@ def main():
                         for step in ['1/7', '2/7', '3/7', '4/7', '5/7', '6/7', '7/7', '9 opcji (A–I)']:
                             assert step in transcript
                         actual = json.loads((runtime / 'settings.json').read_text())
-                        expected = dict(provider=provider, model=model, keybind=keybind, base_url=base_url, mode='digits', selection='single')
+                        expected = dict(provider=provider, model=model, keybind=keybind, base_url=base_url, mode='digits', selection='single', timeout=60)
                         if pause is not None:
                             expected['pause_keybind'] = pause
                         assert actual == expected

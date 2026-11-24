@@ -151,6 +151,9 @@ fn select_model(input: &str, examples: &[(&str, &str)]) -> Result<String> {
 }
 
 fn validate_model(model: &str, provider: Provider) -> Result<()> {
+    if looks_like_secret(model) {
+        bail!("Model nie może być kluczem API. Podaj identyfikator modelu.");
+    }
     if model.is_empty() {
         bail!("Wpisz identyfikator modelu z panelu dostawcy (nie klucz API).");
     }
@@ -165,6 +168,17 @@ fn validate_model(model: &str, provider: Provider) -> Result<()> {
     if provider == Provider::Gemini && (model.contains('/') || model.contains(':')) {
         bail!("Dla Gemini podaj sam identyfikator, bez models/ ani :generateContent.");
     }
+    Ok(())
+}
+
+pub(crate) fn validate_saved(settings: &Settings) -> Result<()> {
+    validate_model(&settings.model, settings.provider)?;
+    api::validate_base_url(&settings.base_url)?;
+    configured_keybind(&settings.keybind)?;
+    if let Some(pause) = &settings.pause_keybind {
+        configured_keybind(pause)?;
+    }
+    crate::platform::validate_keybind_pair(&settings.keybind, settings.pause_keybind.as_deref())?;
     Ok(())
 }
 

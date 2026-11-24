@@ -1,0 +1,74 @@
+name: Bug report
+description: Report a reproducible problem using synthetic, nonprivate data.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For vulnerabilities, follow [SECURITY.md](https://github.com/mirawer/wtyczka/blob/main/SECURITY.md) instead of posting details publicly.
+        Never post API keys, authorization headers, private screenshots or private questions. Use synthetic examples. Review logs and redact sensitive paths and API URLs.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safe to publish
+      options:
+        - label: This is an ordinary bug report, not a private vulnerability disclosure.
+          required: true
+        - label: I removed all keys, tokens, private screenshots/questions and other sensitive data.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: Output of --version; for source builds, include the commit if known.
+      placeholder: "e.g. screen-answer 0.1.5"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows 10 x64
+        - Windows 11 x64
+        - Linux x64 / Niri
+        - Other (not currently supported)
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and installation
+      description: OS build/distro, release executable or checkout, tray/bar; on Linux include Niri, grim and session D-Bus details. For credential-store problems name the Secret Service provider and whether it was unlocked, never its contents. Other desktops and macOS are not supported yet.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Use synthetic data and commands with no secrets. Note the shortcut, digits/dots, single/multiple answers, and whether a worker was already running. Do not attach your settings/runtime directory.
+      placeholder: |
+        1. Start the app with ...
+        2. Run the synthetic demo ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Describe the tray result or error in words; do not upload private screenshots or questions.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Optional sanitized diagnostics
+      description: Relevant status/doctor output or a minimal error only. Check for secrets and personal data before sharing; never paste authorization headers, credential-store exports or full configuration files.
+      render: text

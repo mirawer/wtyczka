@@ -1,15 +1,20 @@
 [package]
 name = "screen-answer"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.89"
 description = "Hotkey-triggered visual multiple-choice assistant for Linux and Windows"
 license = "MIT"
+authors = ["mirawer"]
+repository = "https://github.com/mirawer/wtyczka"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+getrandom = "0.4"
+sha2 = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,13 +25,14 @@ zeroize = "1"
 futures-util = "0.3"
 ksni = "0.3"
 libc = "0.2"
+secret-service = { version = "5.1", default-features = false, features = ["rt-tokio-crypto-rust"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation", "Win32_Graphics_Gdi",
-    "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem",
+    "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Security_Credentials", "Win32_Storage_FileSystem",
     "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_IO", "Win32_System_Ole",
     "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Registry",
     "Win32_System_StationsAndDesktops", "Win32_System_Threading",

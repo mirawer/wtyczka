@@ -22,7 +22,7 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal --component clippy
           rustup target add x86_64-unknown-linux-musl --toolchain 1.95.0
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y musl-tools dbus gnome-keyring
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -50,6 +50,10 @@ jobs:
           fi
           dist/screen-answer-linux-x86_64 --version
           sha256sum dist/screen-answer-linux-x86_64
+      - name: Isolated encrypted keyring and fast-start lifecycle (no user secrets)
+        env:
+          SCREEN_ANSWER_BIN: ${{ github.workspace }}/dist/screen-answer-linux-x86_64
+        run: python3 tests/persistence.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-x86_64

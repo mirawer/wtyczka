@@ -34,6 +34,9 @@ pub fn validate_keybind(key: &str) -> Result<()> {
 pub fn check_keybind_available(key: &str) -> Result<()> {
     ui::check_keybind_available(key)
 }
+pub fn same_keybind(left: &str, right: &str) -> Result<bool> {
+    ui::same_keybind(left, right)
+}
 pub fn validate_keybind_pair(key: &str, pause: Option<&str>) -> Result<()> {
     ui::validate_keybind_pair(key, pause)
 }

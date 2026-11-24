@@ -47,6 +47,11 @@ pub fn validate_keybind(key: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn same_keybind(left: &str, right: &str) -> Result<bool> {
+    Ok(crate::keybind::normalize_keybind(left)?
+        .eq_ignore_ascii_case(&crate::keybind::normalize_keybind(right)?))
+}
+
 pub fn validate_keybind_pair(key: &str, pause: Option<&str>) -> Result<()> {
     let key = crate::keybind::normalize_keybind(key)?;
     if let Some(pause) = pause {

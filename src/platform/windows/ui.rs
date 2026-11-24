@@ -162,6 +162,10 @@ pub fn validate_keybind(keybind: &str) -> Result<()> {
     parse_keybind(keybind).map(|_| ())
 }
 
+pub fn same_keybind(left: &str, right: &str) -> Result<bool> {
+    Ok(parse_keybind(left)? == parse_keybind(right)?)
+}
+
 pub fn validate_keybind_pair(keybind: &str, pause: Option<&str>) -> Result<()> {
     let hotkey = parse_keybind(keybind)?;
     if let Some(pause) = pause
