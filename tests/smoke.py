@@ -40,6 +40,7 @@ class API(http.server.BaseHTTPRequestHandler):
     models = []
     release = threading.Event()
     received = threading.Event()
+    completed = threading.Event()
     output = '9'
     max_choices = 9
     multiple = False
@@ -65,16 +66,23 @@ class API(http.server.BaseHTTPRequestHandler):
         }
         assert 'Return one JSON object' in body['system']
         assert base64.b64decode(body['messages'][0]['content'][0]['source']['data']) == FAKE_IMAGE
+        output = type(self).output
+        multiple = type(self).multiple
         type(self).received.set()
         assert type(self).release.wait(8)
         result = json.dumps({'stop_reason': 'end_turn', 'content': [
             {'type': 'thinking', 'thinking': '', 'signature': 'synthetic-signature'},
-            {'type': 'text', 'text': json.dumps({('answers' if type(self).multiple else 'answer'): type(self).output})}
+            {'type': 'text', 'text': json.dumps({('answers' if multiple else 'answer'): output})}
         ]}).encode()
-        self.send_response(200)
-        self.send_header('Content-Length', str(len(result)))
-        self.end_headers()
-        self.wfile.write(result)
+        try:
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(result)))
+            self.end_headers()
+            self.wfile.write(result)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Expected when pause cancels a request already received by the mock.
+        finally:
+            type(self).completed.set()
 
     def log_message(self, *_):
         pass
@@ -169,10 +177,11 @@ def main():
             base.write_text('// synthetic base config\n')
             loaded = root / 'loaded-path'
             (fakebin / 'niri').write_text('#!/usr/bin/env python3\nimport sys,os,json\nfrom pathlib import Path\nargs=sys.argv[1:]\nif args[:3]==["msg","-j","focused-output"]: print(json.dumps({"name":"FAKE-1"}))\nelif args[:3]==["msg","action","load-config-file"]: Path(os.environ["TEST_LOADED"]).write_text(args[-1])\n')
-            (fakebin / 'grim').write_text('#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(' + repr(FAKE_IMAGE) + ')\n')
+            captures = root / 'captures'
+            (fakebin / 'grim').write_text('#!/usr/bin/env python3\nimport sys,os\nfrom pathlib import Path\nwith Path(os.environ["TEST_CAPTURES"]).open("a") as f: f.write("capture\\n")\nsys.stdout.buffer.write(' + repr(FAKE_IMAGE) + ')\n')
             for p in fakebin.iterdir():
                 p.chmod(0o700)
-            env = dict(os.environ, PATH=f'{fakebin}:{os.environ["PATH"]}', TEST_LOADED=str(loaded))
+            env = dict(os.environ, PATH=f'{fakebin}:{os.environ["PATH"]}', TEST_LOADED=str(loaded), TEST_CAPTURES=str(captures))
             args = [str(BINARY), '--runtime-dir', str(runtime)]
             startup = {'settings': {'provider': 'anthropic', 'model': 'test-model', 'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'keybind': 'Print'}, 'timeout': 5, 'niri_config': str(base)}
             proc = subprocess.Popen(args + ['serve'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
@@ -284,7 +293,7 @@ def main():
                 # configurable binding, single-instance protection, crash recovery.
                 pid, master = pty.fork()
                 if pid == 0:
-                    os.execve(str(BINARY), args + ['--provider', 'anthropic', '--model', 'test-model', '--base-url', startup['settings']['base_url'], '--niri-config', str(base), '--keybind', 'Ctrl+Shift+F8', '--mode', 'digits', '--selection', 'single'], env)
+                    os.execve(str(BINARY), args + ['--provider', 'anthropic', '--model', 'test-model', '--base-url', startup['settings']['base_url'], '--niri-config', str(base), '--keybind', 'Ctrl+Shift+F8', '--pause-keybind', 'off', '--mode', 'digits', '--selection', 'single'], env)
                 transcript = b''
                 sent = False
                 deadline = time.monotonic() + 25
@@ -343,28 +352,35 @@ def main():
                 (runtime / 'settings.json').unlink()
                 wizard_args = args + ['--niri-config', str(base)]
                 cases = [
-                    ([('Dostawca [', 'claude'), ('Model: ', 'wizard-model'), ('Skrót [', ''), ('Odpowiedzi [', ''), ('Tryb [', ''),
+                    ([('Dostawca [', 'claude'), ('Model: ', 'wizard-model'), ('Skrót [', ''), ('Skrót pauzy [brak]: ', 'Ctrl+Shift+F9'), ('Odpowiedzi [', ''), ('Tryb [', ''),
                       ('Klucz API (ukryty): ', ''), ('Klucz API (ukryty): ', 'test-invisible\u200b-key'),
                       ('Klucz API (ukryty): ', 'test-secret-never-log')],
-                     'anthropic', 'wizard-model', 'Print', 'https://api.anthropic.com/v1'),
-                    ([('Dostawca [', ''), ('Model [wizard-model]: ', ''), ('Skrót [Print]: ', ''), ('Odpowiedzi [', ''), ('Tryb [', ''),
+                     'anthropic', 'wizard-model', 'Print', 'https://api.anthropic.com/v1', 'Ctrl+Shift+F9'),
+                    ([('Dostawca [', ''), ('Model [wizard-model]: ', ''), ('Skrót [Print]: ', ''), ('Skrót pauzy [Ctrl+Shift+F9]: ', ''), ('Odpowiedzi [', ''), ('Tryb [', ''),
                       ('Klucz API (ukryty): ', 'test-secret-never-log')],
-                     'anthropic', 'wizard-model', 'Print', 'https://api.anthropic.com/v1'),
-                    ([('Dostawca [', '4'), ('Model: ', 'gemini-test'), ('Skrót [Print]: ', 'Ctrl+F8'), ('Odpowiedzi [', ''), ('Tryb [', ''),
+                     'anthropic', 'wizard-model', 'Print', 'https://api.anthropic.com/v1', 'Ctrl+Shift+F9'),
+                    ([('Dostawca [', '4'), ('Model: ', 'gemini-test'), ('Skrót [Print]: ', 'Ctrl+F8'), ('Skrót pauzy [Ctrl+Shift+F9]: ', 'off'), ('Odpowiedzi [', ''), ('Tryb [', ''),
                       ('Klucz API (ukryty): ', 'test-secret-never-log')],
-                     'gemini', 'gemini-test', 'Ctrl+F8', 'https://generativelanguage.googleapis.com/v1beta'),
+                     'gemini', 'gemini-test', 'Ctrl+F8', 'https://generativelanguage.googleapis.com/v1beta', None),
                     ([('Dostawca [', '5'), ('Adres API: ', f'http://127.0.0.1:{server.server_port}/v1'),
-                      ('Model: ', 'local-vision-model'), ('Skrót [Ctrl+F8]: ', 'PrintScreen'), ('Odpowiedzi [', ''), ('Tryb [', ''),
+                      ('Model: ', 'local-vision-model'), ('Skrót [Ctrl+F8]: ', 'PrintScreen'), ('Skrót pauzy [brak]: ', ''), ('Odpowiedzi [', ''), ('Tryb [', ''),
                       ('Klucz API (ukryty): ', 'test-secret-never-log')],
-                     'openai', 'local-vision-model', 'Print', f'http://127.0.0.1:{server.server_port}/v1'),
+                     'openai', 'local-vision-model', 'Print', f'http://127.0.0.1:{server.server_port}/v1', None),
                 ]
                 try:
-                    for answers, provider, model, keybind, base_url in cases:
+                    for answers, provider, model, keybind, base_url, pause in cases:
                         transcript = interactive_start(wizard_args, env, answers)
-                        for step in ['1/6', '2/6', '3/6', '4/6', '5/6', '6/6', '9 opcji (A–I)']:
+                        for step in ['1/7', '2/7', '3/7', '4/7', '5/7', '6/7', '7/7', '9 opcji (A–I)']:
                             assert step in transcript
                         actual = json.loads((runtime / 'settings.json').read_text())
-                        assert actual == dict(provider=provider, model=model, keybind=keybind, base_url=base_url, mode='digits', selection='single')
+                        expected = dict(provider=provider, model=model, keybind=keybind, base_url=base_url, mode='digits', selection='single')
+                        if pause is not None:
+                            expected['pause_keybind'] = pause
+                        assert actual == expected
+                        overlay = (runtime / 'niri-overlay.kdl').read_text()
+                        assert ('"toggle-pause"' in overlay) == (pause is not None)
+                        if pause is not None:
+                            assert f'{pause} repeat=false' in overlay
                         cli('status')
                         cli('stop')
                         assert API.count == 2, 'Wizard must never capture or call an API'
@@ -374,7 +390,7 @@ def main():
                         provider='anthropic', model='claud-opus-5-5',
                         base_url='https://api.anthropic.com/v1', keybind='Print')))
                     transcript = interactive_start(wizard_args, env, [
-                        ('Dostawca [', ''), ('Model: ', '3'), ('Skrót [Print]: ', ''), ('Odpowiedzi [', ''), ('Tryb [', ''),
+                        ('Dostawca [', ''), ('Model: ', '3'), ('Skrót [Print]: ', ''), ('Skrót pauzy [brak]: ', ''), ('Odpowiedzi [', ''), ('Tryb [', ''),
                         ('Klucz API (ukryty): ', 'test-secret-never-log')])
                     assert '3. Claude Opus 5.5 — claude-opus-5-5' in transcript
                     assert 'Poprzednia nazwa modelu jest nieprawidłowa' in transcript
@@ -392,7 +408,7 @@ def main():
                         count = API.count
                         interactive_start(wizard_args + [
                             '--provider', 'anthropic', '--model', model,
-                            '--base-url', startup['settings']['base_url'], '--keybind', 'Print', '--mode', 'digits', '--selection', 'single'], env,
+                            '--base-url', startup['settings']['base_url'], '--keybind', 'Print', '--pause-keybind', 'off', '--mode', 'digits', '--selection', 'single'], env,
                             [('Klucz API (ukryty): ', 'test-secret-never-log')])
                         control = socket.socket(socket.AF_UNIX)
                         control.connect(str(runtime / 'control.sock'))
@@ -412,7 +428,7 @@ def main():
 
                     API.max_choices = 6
                     dot_args = wizard_args + ['--provider', 'anthropic', '--model', 'test-model',
-                        '--base-url', startup['settings']['base_url'], '--keybind', 'Print', '--selection', 'single']
+                        '--base-url', startup['settings']['base_url'], '--keybind', 'Print', '--pause-keybind', 'off', '--selection', 'single']
                     interactive_start(dot_args, env, [('Tryb [', '2'), ('Klucz API (ukryty): ', 'test-secret-never-log')])
                     assert json.loads((runtime / 'settings.json').read_text())['mode'] == 'dots'
                     control = socket.socket(socket.AF_UNIX)
@@ -446,13 +462,15 @@ def main():
                     for display, max_choices in [('digits', 9), ('dots', 6)]:
                         API.max_choices = max_choices
                         multi_args = wizard_args + ['--provider', 'anthropic', '--model', 'test-model',
-                            '--base-url', startup['settings']['base_url'], '--keybind', 'Print']
+                            '--base-url', startup['settings']['base_url'], '--keybind', 'Print', '--pause-keybind', 'Ctrl+Shift+F9']
                         transcript = interactive_start(multi_args, env, [
                             ('Odpowiedzi [', '2'), ('Tryb [', '1' if display == 'digits' else '2'),
                             ('Klucz API (ukryty): ', 'test-secret-never-log')])
                         assert transcript.index('Odpowiedzi [') < transcript.index('Tryb [')
                         settings = json.loads((runtime / 'settings.json').read_text())
                         assert settings['selection'] == 'multiple' and settings['mode'] == display
+                        assert settings['pause_keybind'] == 'Ctrl+Shift+F9'
+                        assert 'Ctrl+Shift+F9 repeat=false' in (runtime / 'niri-overlay.kdl').read_text()
                         control = socket.socket(socket.AF_UNIX)
                         control.connect(str(runtime / 'control.sock'))
                         daemon_pid = struct.unpack('3i', control.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[0]
@@ -496,7 +514,40 @@ def main():
                             assert {(i%32,i//32) for i,p in enumerate(pixels) if p[0]} == expected_cell_pixels(slot+1, display, slot > 0)
                         time.sleep(0.8)
 
-                        # The next question must remove ALL stale trailing answers.
+                        # Pausing a full answer clears every trailing cell and shows the exact idle dash.
+                        cli('toggle-pause')
+                        wait_for(lambda: active_slots() == [0] and pixmap() == idle)
+                        assert_transparent_no_hover(cells[0])
+                        count = API.count
+                        captured = captures.read_bytes()
+                        API.received.clear()
+                        cli('trigger')
+                        cli('trigger')
+                        assert not API.received.wait(0.2), 'Paused trigger must not send an API request'
+                        assert API.count == count and captures.read_bytes() == captured
+                        assert pixmap() == idle
+
+                        # Resume is idle, not an automatic capture. Then cancel an in-flight request.
+                        cli('toggle-pause')
+                        assert API.count == count and captures.read_bytes() == captured
+                        API.output = ['4']
+                        API.received.clear()
+                        API.completed.clear()
+                        API.release.clear()
+                        cli('trigger')
+                        assert API.received.wait(5)
+                        assert pixmap() == busy
+                        cli('toggle-pause')
+                        wait_for(lambda: active_slots() == [0] and pixmap() == idle)
+                        count = API.count
+                        captured = captures.read_bytes()
+                        cli('toggle-pause')
+                        API.release.set()  # The old server answer arrives AFTER cancellation and resume.
+                        assert API.completed.wait(5)
+                        assert active_slots() == [0] and pixmap() == idle
+                        assert API.count == count and captures.read_bytes() == captured
+
+                        # A fresh trigger after resume works without replaying old work.
                         API.output = ['3']
                         API.received.clear()
                         cli('trigger')
@@ -513,7 +564,7 @@ def main():
                         wait_for(lambda: active_slots() == [0] and pixmap() == error)
                         cli('stop')
                         assert loaded.read_text() == str(base)
-                    print('PASS: multiple-selection wizard, 1\'2 digits/dots, full-size cells up to 9/6 answers, clear stale cells, duplicate rejection, stop')
+                    print('PASS: multiple-selection wizard, 1\'2 digits/dots, full-size cells up to 9/6 answers, pause/resume to identical idle dash, no paused capture/API, cancel late result, duplicate rejection, stop')
                 finally:
                     subprocess.run(args + ['stop'], env=env, capture_output=True, timeout=15)
             finally:

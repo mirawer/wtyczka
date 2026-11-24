@@ -52,6 +52,11 @@ struct Cli {
     keybind: Option<String>,
     #[arg(
         long,
+        help = "Opcjonalny skrót pauzy/wznowienia, np. Ctrl+Shift+F9; off = brak"
+    )]
+    pause_keybind: Option<String>,
+    #[arg(
+        long,
         value_enum,
         help = "digits = cyfry 1–9, dots = kropki 1–6 (normalnie wybierane w kreatorze)"
     )]
@@ -80,7 +85,9 @@ struct Cli {
 enum Action {
     /// Wyślij pojedyncze żądanie analizy do działającego programu.
     Trigger,
-    /// Zakończ program i zwolnij skrót.
+    /// Wstrzymaj/wznów analizę i wyczyść wynik do myślnika.
+    TogglePause,
+    /// Zakończ program i zwolnij skróty.
     Stop,
     /// Pokaż tylko stan procesu, nigdy odpowiedź modelu.
     Status,
@@ -107,6 +114,8 @@ struct Settings {
     model: String,
     base_url: String,
     keybind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pause_keybind: Option<String>,
     #[serde(default)]
     mode: AnswerMode,
     #[serde(default)]
@@ -169,9 +178,12 @@ async fn entry() -> Result<()> {
         Some(Action::Trigger) => {
             client(&runtime, "trigger").await?;
         }
+        Some(Action::TogglePause) => {
+            client(&runtime, "toggle-pause").await?;
+        }
         Some(Action::Stop) => {
             client(&runtime, "stop").await?;
-            println!("Program zatrzymany; skrót zwolniony.");
+            println!("Program zatrzymany; skróty zwolnione.");
         }
         Some(Action::Status) => match client(&runtime, "status").await {
             Ok(_) => println!("Program działa."),
@@ -227,7 +239,9 @@ async fn start(cli: Cli, runtime: PathBuf) -> Result<()> {
     drop(lock(&runtime)?);
     let mut settings = read_settings(&cli, &runtime)?;
     loop {
-        match platform::check_keybind_available(&settings.keybind) {
+        match platform::check_keybind_available(&settings.keybind).and_then(|()| {
+            platform::validate_keybind_pair(&settings.keybind, settings.pause_keybind.as_deref())
+        }) {
             Ok(()) => break,
             Err(error) => {
                 if cli.keybind.is_some() {
@@ -242,7 +256,7 @@ async fn start(cli: Cli, runtime: PathBuf) -> Result<()> {
                         &input
                     };
                     match keybind::normalize_keybind(input).and_then(|key| {
-                        platform::validate_keybind(&key)?;
+                        platform::validate_keybind_pair(&key, settings.pause_keybind.as_deref())?;
                         Ok(key)
                     }) {
                         Ok(key) => {
@@ -250,6 +264,29 @@ async fn start(cli: Cli, runtime: PathBuf) -> Result<()> {
                             break;
                         }
                         Err(_) => eprintln!("Nieprawidłowy skrót. Wpisz np. Ctrl+Shift+F8."),
+                    }
+                }
+            }
+        }
+    }
+    while let Some(pause) = &settings.pause_keybind {
+        match platform::check_keybind_available(pause) {
+            Ok(()) => break,
+            Err(error) => {
+                if cli.pause_keybind.is_some() {
+                    return Err(error);
+                }
+                eprintln!("Nie można użyć skrótu pauzy: {error}");
+                loop {
+                    let input = prompt("Inny skrót pauzy [brak]: ")?;
+                    match setup::configured_pause_keybind(&input, &settings.keybind) {
+                        Ok(key) => {
+                            settings.pause_keybind = key;
+                            break;
+                        }
+                        Err(_) => eprintln!(
+                            "Nieprawidłowy lub powtórzony skrót. Wpisz np. Ctrl+Shift+F9 albo brak."
+                        ),
                     }
                 }
             }
@@ -276,7 +313,10 @@ async fn start(cli: Cli, runtime: PathBuf) -> Result<()> {
         "Liczba poprawnych odpowiedzi: {}.",
         settings.selection.description()
     );
-    println!("\n6/6 — Teraz wklej klucz API. Wpisywane znaki nie będą widoczne.");
+    if let Some(pause) = &settings.pause_keybind {
+        println!("Pauza/wznowienie: {pause}. Pauza czyści wynik do myślnika (-).");
+    }
+    println!("\n7/7 — Teraz wklej klucz API. Wpisywane znaki nie będą widoczne.");
     let key = loop {
         match secret::prompt_key("Klucz API (ukryty): ") {
             Ok(key) => break key,
@@ -353,7 +393,43 @@ async fn client(runtime: &Path, request: &str) -> Result<()> {
     .context("Proces nie odpowiedział na polecenie.")?
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Control {
+    Trigger,
+    TogglePause,
+}
+
 type Job = tokio::task::JoinHandle<Result<answer::Answer>>;
+
+#[derive(Default)]
+struct Analysis {
+    paused: bool,
+    job: Option<Job>,
+    last_trigger: Option<tokio::time::Instant>,
+}
+
+impl Analysis {
+    fn can_trigger(&self) -> bool {
+        !self.paused
+            && self.job.is_none()
+            && self
+                .last_trigger
+                .is_none_or(|t| t.elapsed() >= Duration::from_millis(750))
+    }
+
+    async fn cancel(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.abort();
+            let _ = job.await;
+        }
+    }
+
+    async fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        self.last_trigger = None;
+        self.cancel().await;
+    }
+}
 
 async fn finish_job(job: &mut Option<Job>) -> Result<answer::Answer> {
     match job {
@@ -364,20 +440,25 @@ async fn finish_job(job: &mut Option<Job>) -> Result<answer::Answer> {
     }
 }
 
-async fn trigger(
+async fn apply_control(
+    control: Control,
     api: &std::sync::Arc<Api>,
     ui: &platform::Ui,
     seconds: u64,
-    job: &mut Option<Job>,
-    last: &mut Option<tokio::time::Instant>,
+    analysis: &mut Analysis,
 ) -> Result<bool> {
-    if job.is_some() || last.is_some_and(|t| t.elapsed() < Duration::from_millis(750)) {
+    if control == Control::TogglePause {
+        analysis.toggle_pause().await;
+        ui.update(State::Idle).await?;
+        return Ok(true);
+    }
+    if !analysis.can_trigger() {
         return Ok(false);
     }
-    *last = Some(tokio::time::Instant::now());
+    analysis.last_trigger = Some(tokio::time::Instant::now());
     ui.update(State::Busy).await?;
     let api = api.clone();
-    *job = Some(tokio::spawn(async move {
+    analysis.job = Some(tokio::spawn(async move {
         timeout(Duration::from_secs(seconds + 20), async {
             let image = platform::capture::capture().await?;
             api.solve(&image).await
@@ -410,18 +491,12 @@ async fn run(
     );
     // Install Unix signal handlers before changing any compositor configuration.
     let mut shutdown = platform::shutdown_signal()?;
-    let (triggers_tx, mut triggers_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut ui = platform::Ui::spawn(
-        &runtime,
-        &startup.settings,
-        startup.platform,
-        triggers_tx.clone(),
-    )
-    .await
-    .context("Nie można uruchomić wskaźnika lub zarejestrować skrótu.")?;
-    let mut job: Option<Job> = None;
+    let (controls_tx, mut controls_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut ui = platform::Ui::spawn(&runtime, &startup.settings, startup.platform, controls_tx)
+        .await
+        .context("Nie można uruchomić wskaźnika lub zarejestrować skrótu.")?;
+    let mut analysis = Analysis::default();
     let mut stop_client = None;
-    let mut last_trigger = None;
     // Every error after native UI creation must await cleanup, not merely enqueue
     // it in Drop immediately before the process exits.
     let result: Result<()> = async {
@@ -439,8 +514,11 @@ async fn run(
             tokio::select! {
                 biased;
                 _ = shutdown.wait() => break,
-                result = finish_job(&mut job) => {
-                    job = None;
+                Some(control) = controls_rx.recv() => {
+                    apply_control(control, &api, &ui, startup.timeout, &mut analysis).await?;
+                },
+                result = finish_job(&mut analysis.job) => {
+                    analysis.job = None;
                     let state = match result {
                         Ok(answer) => State::Answer(answer),
                         Err(err) => {
@@ -461,24 +539,21 @@ async fn run(
                     let response = match command {
                         "stop" => { stop_client = Some(stream); break; },
                         "status" => "OK\n",
-                        "trigger" => if trigger(&api, &ui, startup.timeout, &mut job, &mut last_trigger).await? {
-                            "OK\n"
-                        } else { "BUSY\n" },
+                        "trigger" | "toggle-pause" => {
+                            let control = if command == "trigger" { Control::Trigger } else { Control::TogglePause };
+                            if apply_control(control, &api, &ui, startup.timeout, &mut analysis).await? {
+                                "OK\n"
+                            } else { "BUSY\n" }
+                        },
                         _ => "ERROR\n",
                     };
                     let _ = stream.write_all(response.as_bytes()).await;
-                },
-                Some(()) = triggers_rx.recv() => {
-                    trigger(&api, &ui, startup.timeout, &mut job, &mut last_trigger).await?;
                 },
             }
         }
         Ok(())
     }.await;
-    if let Some(job) = job {
-        job.abort();
-        let _ = job.await;
-    }
+    analysis.cancel().await;
     let restored = ui.shutdown().await;
     if let Some(mut stream) = stop_client {
         let response: &[u8] = if restored.is_ok() {
@@ -494,6 +569,45 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pause_cancels_and_discards_work_and_resume_is_idle_without_debounce() {
+        let mut analysis = Analysis::default();
+        assert!(analysis.can_trigger());
+        analysis.last_trigger = Some(tokio::time::Instant::now());
+        assert!(!analysis.can_trigger());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (dropped, ended) = tokio::sync::oneshot::channel::<()>();
+        analysis.job = Some(tokio::spawn(async move {
+            let _guard = dropped;
+            let _ = started.send(());
+            std::future::pending().await
+        }));
+        ready.await.unwrap();
+        analysis.toggle_pause().await;
+        assert!(analysis.paused);
+        assert!(analysis.job.is_none());
+        assert!(!analysis.can_trigger());
+        assert!(
+            ended.await.is_err(),
+            "Paused worker must be dropped before returning"
+        );
+        analysis.toggle_pause().await;
+        assert!(!analysis.paused);
+        assert!(analysis.job.is_none());
+        assert!(analysis.can_trigger());
+
+        // Even an already completed old answer must never be published after a reset.
+        analysis.job = Some(tokio::spawn(async { Ok(answer::Answer::Choice(9)) }));
+        tokio::task::yield_now().await;
+        analysis.toggle_pause().await;
+        assert!(analysis.job.is_none());
+        assert!(
+            timeout(Duration::from_millis(20), finish_job(&mut analysis.job))
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn worker_completion_and_panic_are_both_observed() {

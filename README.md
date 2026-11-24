@@ -11,7 +11,7 @@ Autor: [mirawer](https://github.com/mirawer).
 Albo otwórz **[Releases](https://github.com/mirawer/wtyczka/releases/latest)** → **Assets** → **screen-answer.exe**. Nie wybieraj „Source code”, jeśli chcesz gotowy program.
 
 1. Uruchom pobrany `.exe`. Nie wymaga instalacji Rusta, Pythona, lokalnego modelu ani pakietu VC++.
-2. W kreatorze wybierz dostawcę, model przyjmujący obrazy, skrót, jedną/wiele odpowiedzi i cyfry/kropki. Wklej klucz API dopiero w ostatnim, ukrytym polu (Ctrl+V lub funkcja Wklej terminala), a potem naciśnij Enter. Schowek jest odczytywany tylko na żądanie Ctrl+V, nigdy zmieniany przez aplikację. Błędne znaki powodują ponowne pytanie o klucz zamiast zamknięcia programu.
+2. W kreatorze wybierz dostawcę, model przyjmujący obrazy, skrót analizy, opcjonalny skrót pauzy/wznowienia, jedną/wiele odpowiedzi i cyfry/kropki. Wklej klucz API dopiero w ostatnim, ukrytym polu (Ctrl+V lub funkcja Wklej terminala), a potem naciśnij Enter. Schowek jest odczytywany tylko na żądanie Ctrl+V, nigdy zmieniany przez aplikację. Błędne znaki powodują ponowne pytanie o klucz zamiast zamknięcia programu.
 3. Po komunikacie „Działa w tle” możesz zamknąć terminal. Wyświetl całe pytanie z opcjami i naciśnij wybrany skrót.
 4. Ikony mogą początkowo być w rozwijanym zasobniku Windows. Ich widoczność i kolejność kontroluje system.
 
@@ -21,6 +21,7 @@ W PowerShellu, w katalogu z programem:
 
 ```powershell
 .\screen-answer.exe status
+.\screen-answer.exe toggle-pause
 .\screen-answer.exe stop
 .\screen-answer.exe doctor
 .\screen-answer.exe --selection multiple demo "1'2'3"
@@ -44,14 +45,25 @@ mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}"
 
 Alternatywnie sklonuj kod i uruchom `./screen-answer`; launcher buduje release przy pierwszym starcie (wymaga Rust/Cargo 1.89+ i kompilatora C). W katalogu projektu stan jest przechowywany w `.runtime/`.
 
-Na Linuksie skrót jest dodawany przez tymczasową nakładkę Niri, bez edycji pliku bazowego. Normalne zatrzymanie przywraca bazę. Po `kill -9` użyj `restore-keybind` z tym samym `--runtime-dir` albo uruchom program ponownie. Nie usuwaj katalogu stanu przed przywróceniem skrótu.
+Na Linuksie skróty są dodawane przez jedną tymczasową nakładkę Niri, bez edycji pliku bazowego. Normalne zatrzymanie przywraca bazę i zwalnia oba skróty. Po `kill -9` użyj `restore-keybind` z tym samym `--runtime-dir` albo uruchom program ponownie. Nie usuwaj katalogu stanu przed przywróceniem skrótu.
+
+## Pauza i reset wyniku
+
+W kreatorze ustaw **Skrót pauzy**, np. **Ctrl+Shift+F9**. Domyślnie jest `brak`; Enter zachowuje zapisany wybór, a `brak` lub `off` usuwa dodatkowy skrót. Musi być inny niż skrót analizy; Windows sprawdza dostępność obu przed pytaniem o klucz.
+
+- Pierwsze naciśnięcie wstrzymuje analizę, przerywa oczekiwanie na aktualny wynik i czyści wszystkie komórki do zwykłego **`-`**, identycznego jak po starcie. Bez ikony pauzy, dymka i powiadomienia.
+- W pauzie skrót analizy niczego nie przechwytuje ani nie wysyła. Ponowne naciśnięcie skrótu pauzy wznawia działanie, nadal pokazując `-`; dopiero skrót analizy rozpoczyna nowe pytanie. Stary wynik nie wraca.
+- Klucz pozostaje w pamięci, program nadal działa w tle. Pełne zakończenie: `stop`. Po ponownym uruchomieniu program zaczyna aktywny, nie w pauzie.
+- Żądania już odebranego przez dostawcę nie da się cofnąć: może nadal zostać naliczona opłata, ale jego spóźniona odpowiedź jest odrzucana.
+
+Opcja działa też przez `--pause-keybind Ctrl+Shift+F9` lub `--pause-keybind off`. Ręczny odpowiednik skrótu: `toggle-pause` (Windows: `.\screen-answer.exe toggle-pause`; Linux: `./screen-answer toggle-pause`).
 
 ## Odpowiedzi i dostawcy
 
 - Anthropic/Claude, OpenAI, OpenRouter, Gemini oraz własne API zgodne z OpenAI Chat Completions i obrazami.
 - Cyfry: opcje **1–9** (A–I). Kropki: opcje **1–6** (A–F).
 - Wiele odpowiedzi: np. `1'2'3`, jako pełnowymiarowe komórki, nie miniaturowy tekst w jednej ikonie.
-- `-` — gotowy, `…` — analiza, `?` — brak rozpoznanej odpowiedzi, `!` — błąd.
+- `-` — gotowy albo wstrzymany (ten sam wygląd), `…` — analiza, `?` — brak rozpoznanej odpowiedzi, `!` — błąd.
 - Jedno żądanie naraz, bez kolejkowania kolejnych naciśnięć i bez automatycznych płatnych ponowień.
 - Model wybiera się numerem w kreatorze albo wpisując własny pełny identyfikator. Musi istnieć w katalogu dostawcy i być dostępny dla Twojego klucza.
 

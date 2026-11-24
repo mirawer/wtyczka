@@ -26,6 +26,7 @@ pub fn normalize_keybind(input: &str) -> Result<String> {
         }
         modifiers.push(m);
     }
+    modifiers.sort_unstable();
     modifiers.push(key);
     Ok(modifiers.join("+"))
 }
@@ -38,6 +39,10 @@ mod tests {
         assert_eq!(normalize_keybind("PrintScreen").unwrap(), "Print");
         assert_eq!(
             normalize_keybind("control+shift+F8").unwrap(),
+            "Ctrl+Shift+F8"
+        );
+        assert_eq!(
+            normalize_keybind("Shift+Control+F8").unwrap(),
             "Ctrl+Shift+F8"
         );
         for bad in [

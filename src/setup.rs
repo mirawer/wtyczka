@@ -42,6 +42,19 @@ fn configured_keybind(input: &str) -> Result<String> {
     Ok(key)
 }
 
+pub(crate) fn configured_pause_keybind(input: &str, analyze: &str) -> Result<Option<String>> {
+    let input = input.trim();
+    if looks_like_secret(input) {
+        bail!("Klucz API wpisujesz dopiero na końcu, w ukrytym polu.");
+    }
+    let pause = match input.to_ascii_lowercase().as_str() {
+        "" | "brak" | "off" | "none" => None,
+        _ => Some(configured_keybind(input)?),
+    };
+    crate::platform::validate_keybind_pair(analyze, pause.as_deref())?;
+    Ok(pause)
+}
+
 fn looks_like_secret(input: &str) -> bool {
     input.starts_with("sk-") || input.starts_with("AIza") || input.starts_with("gsk_")
 }
@@ -180,7 +193,7 @@ pub fn configure(
         None => {
             writeln!(
                 out,
-                "1/6 — Z jakiej usługi AI korzystasz? (wybierz nazwę lub numer, NIE klucz)"
+                "1/7 — Z jakiej usługi AI korzystasz? (wybierz nazwę lub numer, NIE klucz)"
             )?;
             writeln!(
                 out,
@@ -263,7 +276,7 @@ pub fn configure(
             model.clone()
         }
         None => {
-            writeln!(out, "\n2/6 — Jakiego modelu chcesz używać?")?;
+            writeln!(out, "\n2/7 — Jakiego modelu chcesz używać?")?;
             let examples = example_models(provider, &base_url);
             if examples.is_empty() {
                 writeln!(
@@ -313,7 +326,7 @@ pub fn configure(
     let keybind = match &cli.keybind {
         Some(keybind) => configured_keybind(keybind)?,
         None => {
-            writeln!(out, "\n3/6 — Jakim skrótem uruchamiać analizę?")?;
+            writeln!(out, "\n3/7 — Jakim skrótem uruchamiać analizę?")?;
             writeln!(
                 out,
                 "Print = Print Screen. Możesz wpisać np. Ctrl+Shift+F8."
@@ -337,10 +350,47 @@ pub fn configure(
             }
         }
     };
+    let pause_keybind = match &cli.pause_keybind {
+        Some(pause) => configured_pause_keybind(pause, &keybind)?,
+        None => {
+            writeln!(out, "\n4/7 — Opcjonalny skrót pauzy i wznowienia")?;
+            writeln!(
+                out,
+                "Np. Ctrl+Shift+F9; brak = bez dodatkowego skrótu. Enter zachowuje wybór."
+            )?;
+            writeln!(
+                out,
+                "Pauza przerywa analizę i czyści wynik do myślnika (-), bez innego oznaczenia. Ten sam skrót wznawia; potem naciśnij skrót analizy."
+            )?;
+            let saved_pause = saved.and_then(|s| s.pause_keybind.as_deref());
+            let default = saved_pause.filter(|key| configured_pause_keybind(key, &keybind).is_ok());
+            if saved_pause.is_some() && default.is_none() {
+                writeln!(
+                    out,
+                    "Poprzedni skrót pauzy jest nieprawidłowy lub pokrywa się z analizą — wybierz ponownie."
+                )?;
+            }
+            loop {
+                out.flush()?;
+                let input = ask_value(ask, "Skrót pauzy", Some(default.unwrap_or("brak")))?;
+                if looks_like_secret(&input) {
+                    secret_warning(out)?;
+                    continue;
+                }
+                match configured_pause_keybind(&input, &keybind) {
+                    Ok(pause) => break pause,
+                    Err(_) => writeln!(
+                        out,
+                        "Nieprawidłowy lub powtórzony skrót pauzy. Wpisz inny niż skrót analizy, np. Ctrl+Shift+F9, albo brak."
+                    ),
+                }?;
+            }
+        }
+    };
     let selection = match cli.selection {
         Some(selection) => selection,
         None => {
-            writeln!(out, "\n4/6 — Jedna czy wiele poprawnych odpowiedzi?")?;
+            writeln!(out, "\n5/7 — Jedna czy wiele poprawnych odpowiedzi?")?;
             writeln!(
                 out,
                 "  1. Jedna odpowiedź (single)\n  2. Wiele odpowiedzi (multiple)"
@@ -380,7 +430,7 @@ pub fn configure(
     let mode = match cli.mode {
         Some(mode) => mode,
         None => {
-            writeln!(out, "\n5/6 — Jak wyświetlać odpowiedź?")?;
+            writeln!(out, "\n6/7 — Jak wyświetlać odpowiedź?")?;
             writeln!(out, "  1. Cyfry 1–9 (A–I)\n  2. Kropki 1–6 (A–F)")?;
             writeln!(
                 out,
@@ -412,6 +462,7 @@ pub fn configure(
         model,
         base_url,
         keybind,
+        pause_keybind,
         mode,
         selection,
     })
@@ -429,6 +480,7 @@ mod tests {
             model: "saved-vision-model".into(),
             base_url: Provider::Anthropic.default_base().into(),
             keybind: "Ctrl+Shift+F8".into(),
+            pause_keybind: None,
             mode: AnswerMode::Digits,
             selection: SelectionMode::Single,
         }
@@ -462,22 +514,27 @@ mod tests {
         let (settings, prompts, text) = run(
             &["screen-answer"],
             None,
-            &["", "vision-model", "", "2", "2"],
+            &["", "vision-model", "", "", "2", "2"],
         );
         assert_eq!(settings.selection, SelectionMode::Multiple);
         assert_eq!(settings.mode, AnswerMode::Dots);
-        assert!(prompts[3].starts_with("Odpowiedzi ["));
-        assert!(prompts[4].starts_with("Tryb ["));
+        assert!(prompts[3].starts_with("Skrót pauzy ["));
+        assert!(prompts[4].starts_with("Odpowiedzi ["));
+        assert!(prompts[5].starts_with("Tryb ["));
         assert!(text.contains("1'2"));
         assert!(text.contains("5 = jedna nad kwadratem czterech"));
-        let (again, prompts, _) = run(&["screen-answer"], Some(&settings), &["", "", "", "", ""]);
+        let (again, prompts, _) = run(
+            &["screen-answer"],
+            Some(&settings),
+            &["", "", "", "", "", ""],
+        );
         assert_eq!(again.selection, SelectionMode::Multiple);
         assert_eq!(again.mode, AnswerMode::Dots);
         assert!(prompts.last().unwrap().contains("2 — kropki 1–6"));
         let (changed, _, _) = run(
             &["screen-answer"],
             Some(&settings),
-            &["", "", "", "wrong", "single", "bad", "digits"],
+            &["", "", "", "", "wrong", "single", "bad", "digits"],
         );
         assert_eq!(changed.selection, SelectionMode::Single);
         assert_eq!(changed.mode, AnswerMode::Digits);
@@ -488,6 +545,72 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"provider":"anthropic","model":"vision-model","base_url":"https://api.anthropic.com/v1","keybind":"Print"}"#).unwrap();
         assert_eq!(settings.mode, AnswerMode::Digits);
         assert_eq!(settings.selection, SelectionMode::Single);
+        assert_eq!(settings.pause_keybind, None);
+        assert!(
+            !serde_json::to_value(&settings)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("pause_keybind")
+        );
+    }
+
+    #[test]
+    fn optional_pause_keybind_is_saved_editable_and_can_be_removed() {
+        let (settings, _, text) = run(
+            &["screen-answer"],
+            None,
+            &["", "vision-model", "", "Ctrl+Shift+F9", "", ""],
+        );
+        assert_eq!(settings.pause_keybind.as_deref(), Some("Ctrl+Shift+F9"));
+        assert!(text.contains("myślnika (-)"));
+        let (again, prompts, _) = run(
+            &["screen-answer"],
+            Some(&settings),
+            &["", "", "", "", "", ""],
+        );
+        assert_eq!(again.pause_keybind, settings.pause_keybind);
+        assert_eq!(prompts[3], "Skrót pauzy [Ctrl+Shift+F9]: ");
+        let (cleared, _, _) = run(
+            &["screen-answer"],
+            Some(&settings),
+            &["", "", "", "off", "", ""],
+        );
+        assert_eq!(cleared.pause_keybind, None);
+        let (changed, prompts, text) = run(
+            &["screen-answer"],
+            Some(&settings),
+            &["", "", "Ctrl+Shift+F9", "", "", ""],
+        );
+        assert_eq!(changed.pause_keybind, None);
+        assert_eq!(prompts[3], "Skrót pauzy [brak]: ");
+        assert!(text.contains("pokrywa się z analizą"));
+    }
+
+    #[test]
+    fn invalid_or_duplicate_pause_keys_reprompt_without_echoing_secrets() {
+        let (settings, _, text) = run(
+            &["screen-answer"],
+            None,
+            &[
+                "",
+                "vision-model",
+                "Shift+Control+F8",
+                "Control+Shift+F8",
+                "sk-dummy-not-real",
+                "Ctrl++F9",
+                "Ctrl+Shift+F9",
+                "",
+                "",
+            ],
+        );
+        assert_eq!(settings.keybind, "Ctrl+Shift+F8");
+        assert_eq!(settings.pause_keybind.as_deref(), Some("Ctrl+Shift+F9"));
+        assert!(text.contains("powtórzony skrót pauzy"));
+        assert!(!text.contains("sk-dummy-not-real"));
+        assert!(!text.contains("Ctrl++F9"));
+        assert!(configured_pause_keybind("Ctrl+F8", "Control+F8").is_err());
+        assert!(configured_pause_keybind("sk-dummy-not-real", "Print").is_err());
     }
 
     #[test]
@@ -512,7 +635,8 @@ mod tests {
             ("4", Provider::Gemini, "1", "gemini-3.5-flash-lite"),
             ("4", Provider::Gemini, "8", "gemini-4-carbon"),
         ] {
-            let (settings, _, text) = run(&["screen-answer"], None, &[number, choice, "", "", ""]);
+            let (settings, _, text) =
+                run(&["screen-answer"], None, &[number, choice, "", "", "", ""]);
             assert_eq!(settings.provider, provider);
             assert_eq!(settings.base_url, provider.default_base());
             assert_eq!(settings.model, expected);
@@ -534,7 +658,7 @@ mod tests {
         let (settings, prompts, text) = run(
             &["screen-answer"],
             Some(&saved),
-            &["", "claud-opus-5-5", "3", "", "", ""],
+            &["", "claud-opus-5-5", "3", "", "", "", ""],
         );
         assert_eq!(settings.model, "claude-opus-5-5");
         assert_eq!(prompts[1], "Model: ");
@@ -582,21 +706,21 @@ mod tests {
         for (previous, answers, model, keybind, model_prompt) in [
             (
                 None,
-                ["", "vision-model", "", "", ""],
+                ["", "vision-model", "", "", "", ""],
                 "vision-model",
                 "Print",
                 "Model: ",
             ),
             (
                 Some(&saved),
-                ["", "", "", "", ""],
+                ["", "", "", "", "", ""],
                 "saved-vision-model",
                 "Ctrl+Shift+F8",
                 "Model [saved-vision-model]: ",
             ),
             (
                 Some(&saved),
-                ["claude", "new-model", "PrintScreen", "", ""],
+                ["claude", "new-model", "PrintScreen", "", "", ""],
                 "new-model",
                 "Print",
                 "Model [saved-vision-model]: ",
@@ -608,7 +732,7 @@ mod tests {
             assert_eq!(settings.keybind, keybind);
             assert_eq!(settings.mode, AnswerMode::Digits);
             assert_eq!(settings.selection, SelectionMode::Single);
-            assert_eq!(prompts.len(), 5);
+            assert_eq!(prompts.len(), 6);
             assert_eq!(prompts[1], model_prompt);
             assert!(text.contains("9 opcji (A–I)"));
         }
@@ -619,7 +743,7 @@ mod tests {
         let (settings, prompts, _) = run(
             &["screen-answer"],
             Some(&saved()),
-            &["4", "gemini-model", "", "", ""],
+            &["4", "gemini-model", "", "", "", ""],
         );
         assert_eq!(settings.provider, Provider::Gemini);
         assert_eq!(settings.base_url, Provider::Gemini.default_base());
@@ -636,6 +760,7 @@ mod tests {
                 "http://remote.example/v1",
                 "http://localhost:8000/v1",
                 "local-model",
+                "",
                 "",
                 "",
                 "",
@@ -662,10 +787,11 @@ mod tests {
                 "Print",
                 "",
                 "",
+                "",
             ],
         );
         assert_eq!(settings.model, "vision-model");
-        assert_eq!(prompts.len(), 10);
+        assert_eq!(prompts.len(), 11);
         assert!(!text.contains("sk-dummy-not-real"));
         assert!(text.contains("unieważnij"));
     }
@@ -683,6 +809,8 @@ mod tests {
                 "http://localhost:8000/v1",
                 "--keybind",
                 "Ctrl+F8",
+                "--pause-keybind",
+                "Ctrl+F9",
                 "--mode",
                 "digits",
                 "--selection",
@@ -693,6 +821,7 @@ mod tests {
         );
         assert!(prompts.is_empty());
         assert_eq!(settings.keybind, "Ctrl+F8");
+        assert_eq!(settings.pause_keybind.as_deref(), Some("Ctrl+F9"));
         assert_eq!(settings.model, "flag-model");
     }
 
@@ -703,6 +832,7 @@ mod tests {
             model: "server-one-model".into(),
             base_url: "http://localhost:8000/v1".into(),
             keybind: "Print".into(),
+            pause_keybind: None,
             mode: AnswerMode::Digits,
             selection: SelectionMode::Single,
         };
@@ -713,6 +843,7 @@ mod tests {
                 "",
                 "http://localhost:9000/v1",
                 "server-two-model",
+                "",
                 "",
                 "",
                 "",

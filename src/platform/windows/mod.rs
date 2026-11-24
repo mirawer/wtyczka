@@ -10,7 +10,7 @@ pub mod ipc {
 }
 
 use crate::{
-    Cli, Settings,
+    Cli, Control, Settings,
     display::State,
     mode::{AnswerMode, SelectionMode},
 };
@@ -34,13 +34,20 @@ pub fn validate_keybind(key: &str) -> Result<()> {
 pub fn check_keybind_available(key: &str) -> Result<()> {
     ui::check_keybind_available(key)
 }
+pub fn validate_keybind_pair(key: &str, pause: Option<&str>) -> Result<()> {
+    ui::validate_keybind_pair(key, pause)
+}
 
 pub fn doctor(cli: &Cli, runtime: &Path) -> Result<()> {
     let key = crate::keybind::normalize_keybind(cli.keybind.as_deref().unwrap_or("Print"))?;
-    validate_keybind(&key)?;
+    let pause = crate::setup::configured_pause_keybind(
+        cli.pause_keybind.as_deref().unwrap_or("off"),
+        &key,
+    )?;
     capture::check_environment()?;
     println!(
-        "Windows: natywne Win32/GDI, bez dodatkowych programów\nSkrót: {key} (składnia poprawna; dostępność sprawdzana przy starcie)\nStan użytkownika: {}\nSprawdź zasobnik poleceniem demo. Jeśli Print Screen jest zajęty przez Narzędzie Wycinanie, wybierz inny skrót.",
+        "Windows: natywne Win32/GDI, bez dodatkowych programów\nSkrót: {key}\nSkrót pauzy: {}\nSkładnia poprawna; dostępność skrótów sprawdzana przy starcie\nStan użytkownika: {}\nSprawdź zasobnik poleceniem demo. Jeśli Print Screen jest zajęty przez Narzędzie Wycinanie, wybierz inny skrót.",
+        pause.as_deref().unwrap_or("brak"),
         runtime.display()
     );
     Ok(())
@@ -72,14 +79,15 @@ impl Ui {
         _runtime: &Path,
         settings: &Settings,
         _startup: Startup,
-        triggers: UnboundedSender<()>,
+        controls: UnboundedSender<Control>,
     ) -> Result<Self> {
         Ok(Self {
             native: ui::Ui::spawn(
                 settings.mode,
                 settings.selection,
                 &settings.keybind,
-                triggers,
+                settings.pause_keybind.as_deref(),
+                controls,
             )
             .await?,
         })

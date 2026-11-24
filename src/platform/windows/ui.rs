@@ -38,11 +38,13 @@ use windows_sys::Win32::{
 };
 
 use crate::{
+    Control,
     display::{State, cell_states, render_cell},
     mode::{AnswerMode, SelectionMode},
 };
 
 const HOTKEY_ID: i32 = 1;
+const PAUSE_HOTKEY_ID: i32 = 2;
 const WAKE: u32 = WM_APP + 1;
 const RESTORE_TIMER: usize = 1;
 static NEXT_CLASS: AtomicU64 = AtomicU64::new(1);
@@ -57,14 +59,23 @@ impl Ui {
         mode: AnswerMode,
         selection: SelectionMode,
         keybind: &str,
-        triggers: UnboundedSender<()>,
+        pause: Option<&str>,
+        controls: UnboundedSender<Control>,
     ) -> Result<Self> {
-        Self::start(
-            mode,
-            selection,
-            Some((parse_keybind(keybind)?, keybind.to_owned(), triggers)),
-        )
-        .await
+        validate_keybind_pair(keybind, pause)?;
+        let mut keys = vec![Binding {
+            id: HOTKEY_ID,
+            hotkey: parse_keybind(keybind)?,
+            name: keybind.to_owned(),
+        }];
+        if let Some(pause) = pause {
+            keys.push(Binding {
+                id: PAUSE_HOTKEY_ID,
+                hotkey: parse_keybind(pause)?,
+                name: pause.to_owned(),
+            });
+        }
+        Self::start(mode, selection, Some(Bindings { keys, controls })).await
     }
 
     /// Synthetic-answer demo: no global shortcut is registered or altered.
@@ -75,7 +86,7 @@ impl Ui {
     async fn start(
         mode: AnswerMode,
         selection: SelectionMode,
-        binding: Option<(Hotkey, String, UnboundedSender<()>)>,
+        binding: Option<Bindings>,
     ) -> Result<Self> {
         let (commands, receiver) = mpsc::channel();
         let dispatch = Arc::new(Dispatch {
@@ -149,6 +160,37 @@ impl Drop for Ui {
 /// Parsing only: registration/conflict checks happen on the UI thread during spawn.
 pub fn validate_keybind(keybind: &str) -> Result<()> {
     parse_keybind(keybind).map(|_| ())
+}
+
+pub fn validate_keybind_pair(keybind: &str, pause: Option<&str>) -> Result<()> {
+    let hotkey = parse_keybind(keybind)?;
+    if let Some(pause) = pause
+        && hotkey == parse_keybind(pause)?
+    {
+        bail!("Skrót pauzy musi być inny niż skrót analizy.");
+    }
+    Ok(())
+}
+
+struct Binding {
+    id: i32,
+    hotkey: Hotkey,
+    name: String,
+}
+
+struct Bindings {
+    keys: Vec<Binding>,
+    controls: UnboundedSender<Control>,
+}
+
+fn hotkey_control(id: usize) -> Option<Control> {
+    if id == HOTKEY_ID as usize {
+        Some(Control::Trigger)
+    } else if id == PAUSE_HOTKEY_ID as usize {
+        Some(Control::TogglePause)
+    } else {
+        None
+    }
 }
 
 /// A short-lived thread checks ownership before the user is asked for an API key.
@@ -299,7 +341,7 @@ impl Dispatch {
 }
 
 struct Events {
-    triggers: Option<UnboundedSender<()>>,
+    controls: Option<UnboundedSender<Control>>,
     taskbar_created: u32,
     restore_requested: Cell<bool>,
     theme_changed: Cell<bool>,
@@ -320,9 +362,11 @@ unsafe extern "system" fn window_proc(
         let events = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Events;
         if !events.is_null() {
             let events = &*events;
-            if message == WM_HOTKEY && wparam == HOTKEY_ID as usize {
-                if let Some(triggers) = &events.triggers {
-                    let _ = triggers.send(());
+            if message == WM_HOTKEY
+                && let Some(control) = hotkey_control(wparam)
+            {
+                if let Some(controls) = &events.controls {
+                    let _ = controls.send(control);
                 }
                 return 0;
             }
@@ -368,7 +412,7 @@ struct Native {
     class: Vec<u16>,
     class_registered: bool,
     hwnd: HWND,
-    hotkey_registered: bool,
+    registered_hotkeys: Vec<i32>,
     events: Box<Events>,
     mode: AnswerMode,
     state: State,
@@ -380,12 +424,12 @@ impl Native {
     fn new(
         mode: AnswerMode,
         selection: SelectionMode,
-        binding: Option<(Hotkey, String, UnboundedSender<()>)>,
+        binding: Option<Bindings>,
         dispatch: Arc<Dispatch>,
     ) -> Result<Self> {
-        let (binding, triggers) = match binding {
-            Some((hotkey, keybind, triggers)) => (Some((hotkey, keybind)), Some(triggers)),
-            None => (None, None),
+        let (bindings, controls) = match binding {
+            Some(binding) => (binding.keys, Some(binding.controls)),
+            None => (Vec::new(), None),
         };
         let count = if selection == SelectionMode::Multiple {
             usize::from(mode.max_choices())
@@ -403,9 +447,9 @@ impl Native {
             class,
             class_registered: false,
             hwnd: null_mut(),
-            hotkey_registered: false,
+            registered_hotkeys: Vec::new(),
             events: Box::new(Events {
-                triggers,
+                controls,
                 taskbar_created: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
                 restore_requested: Cell::new(false),
                 theme_changed: Cell::new(false),
@@ -452,22 +496,24 @@ impl Native {
         if native.hwnd.is_null() {
             return Err(win_error("CreateWindowExW"));
         }
-        if let Some((hotkey, keybind)) = binding {
+        for binding in bindings {
             if unsafe {
                 RegisterHotKey(
                     native.hwnd,
-                    HOTKEY_ID,
-                    hotkey.modifiers | MOD_NOREPEAT,
-                    hotkey.key,
+                    binding.id,
+                    binding.hotkey.modifiers | MOD_NOREPEAT,
+                    binding.hotkey.key,
                 )
             } == 0
             {
                 let error = std::io::Error::last_os_error();
                 bail!(
-                    "Cannot register Windows hotkey {keybind:?}: {error}. It may already be registered by another application or reserved by Windows. PrintScreen/Print may be owned by Snipping Tool (including the Windows Print Screen screen-snipping setting). Choose a different --keybind, e.g. Ctrl+Shift+F8; screen-answer does not change Windows settings, install hooks, or require administrator access."
+                    "Cannot register Windows hotkey {:?}: {error}. It may already be registered by another application or reserved by Windows. Choose a different shortcut; screen-answer does not change Windows settings, install hooks, or require administrator access.",
+                    binding.name
                 );
             }
-            native.hotkey_registered = true;
+            // A later registration failure still drops Native and releases earlier keys.
+            native.registered_hotkeys.push(binding.id);
         }
         native.cache_state(State::Idle, native.foreground)?;
         // Startup remains strict: do not silently succeed without a working tray.
@@ -644,8 +690,8 @@ impl Drop for Native {
         if !self.hwnd.is_null() {
             unsafe {
                 KillTimer(self.hwnd, RESTORE_TIMER);
-                if self.hotkey_registered {
-                    UnregisterHotKey(self.hwnd, HOTKEY_ID);
+                for id in self.registered_hotkeys.drain(..) {
+                    UnregisterHotKey(self.hwnd, id);
                 }
             }
             for (index, slot) in self.slots.iter_mut().enumerate() {
@@ -886,6 +932,26 @@ mod tests {
             [255, 255, 255, 255, 0, 0, 0, 0, 128, 255, 255, 255]
         );
         assert_eq!((icon.width, icon.height), (3, 1));
+    }
+
+    #[test]
+    fn shortcuts_route_to_distinct_controls_and_aliases_cannot_overlap() {
+        assert_eq!(hotkey_control(HOTKEY_ID as usize), Some(Control::Trigger));
+        assert_eq!(
+            hotkey_control(PAUSE_HOTKEY_ID as usize),
+            Some(Control::TogglePause)
+        );
+        assert_eq!(hotkey_control(0), None);
+        for (key, pause) in [
+            ("Print", "snapshot"),
+            ("Ctrl+Shift+F8", "shift+control+f8"),
+            ("Win+A", "Mod+a"),
+            ("Ctrl+Return", "Control+Enter"),
+        ] {
+            assert!(validate_keybind_pair(key, Some(pause)).is_err());
+        }
+        assert!(validate_keybind_pair("Ctrl+Shift+F8", Some("Ctrl+Shift+F9")).is_ok());
+        assert!(validate_keybind_pair("Print", None).is_ok());
     }
 
     #[test]
