@@ -1,0 +1,13 @@
+/target/
+/bin/
+/.cargo-home/
+/.cache/
+/.runtime/
+# Local desktop configuration backups/experiments, not project sources.
+/integration/
+# Obsolete local deployment notes; public instructions are in README.md.
+/README.pl.txt
+__pycache__/
+*.py[cod]
+.env
+.env.*

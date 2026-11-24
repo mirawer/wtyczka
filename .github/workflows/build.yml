@@ -1,0 +1,112 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux x86_64 (musl)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
+          rustup target add x86_64-unknown-linux-musl --toolchain 1.95.0
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Unit tests and Clippy (no external API)
+        run: |
+          cargo +1.95.0 test --locked
+          cargo +1.95.0 clippy --locked --all-targets -- -D warnings
+      - name: Standalone Linux executable
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo +1.95.0 build --locked --release --target x86_64-unknown-linux-musl
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/screen-answer dist/screen-answer-linux-x86_64
+          if readelf -l dist/screen-answer-linux-x86_64 | grep -q 'Requesting program interpreter'; then
+            echo 'Unexpected dynamic ELF interpreter'; exit 1
+          fi
+          if readelf -d dist/screen-answer-linux-x86_64 | grep -q '(NEEDED)'; then
+            echo 'Unexpected dynamic library dependency'; exit 1
+          fi
+          dist/screen-answer-linux-x86_64 --version
+          sha256sum dist/screen-answer-linux-x86_64
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64 (MSVC, static CRT)
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build and native Windows unit/IPC tests (no external API)
+        run: |
+          cargo +1.95.0 build --locked --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.95.0 test --locked --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/screen-answer.exe dist/screen-answer.exe
+          $Events = cargo +1.95.0 test --locked --release --target x86_64-pc-windows-msvc --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $Test = @($Events | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable
+          })
+          if ($Test.Count -ne 1) { throw 'Expected one Windows test executable' }
+          Copy-Item $Test[0].executable dist/screen-answer-tests.exe
+          ./dist/screen-answer.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify Windows system DLL imports only
+        run: |
+          $Vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $VS = & $Vswhere -latest -products '*' -property installationPath
+          $Dumpbin = Get-ChildItem "$VS/VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $Dumpbin) { throw 'dumpbin.exe not found' }
+          $Allowed = @('kernel32.dll', 'kernelbase.dll', 'ntdll.dll', 'user32.dll', 'gdi32.dll',
+            'ws2_32.dll', 'advapi32.dll', 'bcrypt.dll', 'bcryptprimitives.dll', 'shell32.dll',
+            'userenv.dll', 'ucrtbase.dll', 'ole32.dll', 'synchronization.dll')
+          foreach ($File in @('dist/screen-answer.exe', 'dist/screen-answer-tests.exe')) {
+            $Report = & $Dumpbin /DEPENDENTS $File
+            if ($LASTEXITCODE -ne 0) { throw "Cannot inspect $File" }
+            $Dlls = @($Report | ForEach-Object {
+              if ($_ -match '^\s+([A-Za-z0-9._-]+\.dll)\s*$') { $Matches[1].ToLowerInvariant() }
+            })
+            if (-not $Dlls.Count) { throw "No DLL imports found in $File" }
+            foreach ($Dll in $Dlls) {
+              if ($Dll -notin $Allowed -and $Dll -notlike 'api-ms-win-*.dll' -and $Dll -notlike 'ext-ms-win-*.dll') {
+                throw "Unexpected runtime DLL in ${File}: $Dll"
+              }
+            }
+            Write-Host "$File uses Windows system DLLs only: $($Dlls -join ', ')"
+          }
+          Get-FileHash dist/screen-answer.exe -Algorithm SHA256
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x86_64
+          path: dist/*
+          if-no-files-found: error

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+export CARGO_HOME="$ROOT/.cargo-home"
+export CARGO_TARGET_DIR="$ROOT/target"
+export XDG_CACHE_HOME="$ROOT/.cache"
+BIN="$ROOT/bin/screen-answer"
+if [[ ! -x "$BIN" || "$ROOT/Cargo.toml" -nt "$BIN" || "$ROOT/Cargo.lock" -nt "$BIN" ]] \
+    || [[ -n "$(find "$ROOT/src" -type f -newer "$BIN" -print -quit 2>/dev/null || true)" ]]; then
+    cargo build --release --locked --quiet
+    mkdir -p "$ROOT/bin"
+    cp "$ROOT/target/release/screen-answer" "$BIN.new"
+    chmod 755 "$BIN.new"
+    mv -f "$BIN.new" "$BIN"
+fi
+exec "$BIN" "$@"
