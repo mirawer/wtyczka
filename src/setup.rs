@@ -77,8 +77,9 @@ fn ask_value(
     .to_owned())
 }
 
-// Examples verified against provider docs / the public OpenRouter catalog.
-// These are not an account-specific availability check; custom IDs remain allowed.
+// Image-capable examples verified against provider docs / OpenRouter on 2026-11-24.
+// Sources are linked in README.md. This is not an account-specific availability check.
+// Keep existing numbers stable; custom IDs remain allowed.
 fn example_models(provider: Provider, base: &str) -> &'static [(&'static str, &'static str)] {
     if base.trim_end_matches('/') != provider.default_base() {
         return &[];
@@ -88,14 +89,38 @@ fn example_models(provider: Provider, base: &str) -> &'static [(&'static str, &'
             ("claude-haiku-5-5", "Claude Haiku 5.5"),
             ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
             ("claude-opus-5-5", "Claude Opus 5.5"),
+            ("claude-fable-5-2", "Claude Fable 5.2 (retencja 30 dni)"),
+            ("claude-sonnet-4-6", "Claude Sonnet 4.6 (starszy model)"),
         ],
-        Provider::Openai => &[("gpt-5.4-mini", "GPT-5.4 mini")],
+        Provider::Openai => &[
+            ("gpt-5.4-mini", "GPT-5.4 mini"),
+            ("gpt-5.4", "GPT-5.4"),
+            ("gpt-5.2", "GPT-5.2"),
+            ("gpt-6-luna", "GPT-6 Luna"),
+            ("gpt-6.2-sol", "GPT-6.2 Sol"),
+            ("gpt-6.2-astra", "GPT-6.2 Astra"),
+        ],
         Provider::Openrouter => &[
             ("anthropic/claude-haiku-5.5", "Claude Haiku 5.5"),
             ("anthropic/claude-sonnet-5.5", "Claude Sonnet 5.5"),
             ("anthropic/claude-opus-5.5", "Claude Opus 5.5"),
+            ("openai/gpt-5.4-mini", "GPT-5.4 mini"),
+            ("openai/gpt-6-luna", "GPT-6 Luna"),
+            ("openai/gpt-6.2-sol", "GPT-6.2 Sol"),
+            ("google/gemini-3.8-flash", "Gemini 3.8 Flash"),
+            ("google/gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+            ("google/gemini-4-carbon", "Gemini 4 Carbon"),
         ],
-        Provider::Gemini => &[("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite")],
+        Provider::Gemini => &[
+            ("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite"),
+            ("gemini-3.8-flash", "Gemini 3.8 Flash"),
+            ("gemini-3.6-flash", "Gemini 3.6 Flash"),
+            ("gemini-3.1-flash-lite", "Gemini 3.1 Flash-Lite"),
+            ("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+            ("gemini-4-argon", "Gemini 4 Argon"),
+            ("gemini-4-neon", "Gemini 4 Neon"),
+            ("gemini-4-carbon", "Gemini 4 Carbon"),
+        ],
     }
 }
 
@@ -466,11 +491,37 @@ mod tests {
     }
 
     #[test]
-    fn selecting_opus_by_number_uses_correct_id() {
-        let (settings, _, text) = run(&["screen-answer"], None, &["1", "3", "", "", ""]);
-        assert_eq!(settings.model, "claude-opus-5-5");
-        for id in ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"] {
-            assert!(text.contains(id));
+    fn wizard_selects_models_by_number_for_every_provider() {
+        for (number, provider, choice, expected) in [
+            ("1", Provider::Anthropic, "1", "claude-haiku-5-5"),
+            ("1", Provider::Anthropic, "2", "claude-sonnet-5-5"),
+            ("1", Provider::Anthropic, "3", "claude-opus-5-5"),
+            ("1", Provider::Anthropic, "4", "claude-fable-5-2"),
+            ("1", Provider::Anthropic, "5", "claude-sonnet-4-6"),
+            ("2", Provider::Openai, "1", "gpt-5.4-mini"),
+            ("2", Provider::Openai, "6", "gpt-6.2-astra"),
+            ("3", Provider::Openrouter, "1", "anthropic/claude-haiku-5.5"),
+            (
+                "3",
+                Provider::Openrouter,
+                "2",
+                "anthropic/claude-sonnet-5.5",
+            ),
+            ("3", Provider::Openrouter, "3", "anthropic/claude-opus-5.5"),
+            ("3", Provider::Openrouter, "9", "google/gemini-4-carbon"),
+            ("4", Provider::Gemini, "1", "gemini-3.5-flash-lite"),
+            ("4", Provider::Gemini, "8", "gemini-4-carbon"),
+        ] {
+            let (settings, _, text) = run(&["screen-answer"], None, &[number, choice, "", "", ""]);
+            assert_eq!(settings.provider, provider);
+            assert_eq!(settings.base_url, provider.default_base());
+            assert_eq!(settings.model, expected);
+            for (index, (id, label)) in example_models(provider, &settings.base_url)
+                .iter()
+                .enumerate()
+            {
+                assert!(text.contains(&format!("{}. {label} — {id}", index + 1)));
+            }
         }
     }
 
@@ -493,23 +544,36 @@ mod tests {
 
     #[test]
     fn model_numbers_are_checked_and_ids_can_be_entered_directly() {
-        let examples = example_models(Provider::Anthropic, Provider::Anthropic.default_base());
-        for input in ["0", "4", "99999999999999999999999999999999"] {
-            assert!(select_model(input, examples).is_err());
+        for provider in [
+            Provider::Anthropic,
+            Provider::Openai,
+            Provider::Openrouter,
+            Provider::Gemini,
+        ] {
+            let examples = example_models(provider, provider.default_base());
+            assert!(examples.len() >= 4, "{provider:?} needs multiple examples");
+            let mut ids = std::collections::HashSet::new();
+            for (index, (id, label)) in examples.iter().enumerate() {
+                assert!(ids.insert(id), "Duplicate model: {id}");
+                assert!(!label.is_empty());
+                assert_eq!(
+                    select_model(&(index + 1).to_string(), examples).unwrap(),
+                    *id
+                );
+                validate_model(id, provider).unwrap();
+                api::endpoint_url(provider, id, provider.default_base()).unwrap();
+            }
+            let past_end = (examples.len() + 1).to_string();
+            for input in ["0", past_end.as_str(), "99999999999999999999999999999999"] {
+                assert!(select_model(input, examples).is_err());
+            }
+            assert_eq!(
+                select_model("my-future-model", examples).unwrap(),
+                "my-future-model"
+            );
+            assert!(example_models(provider, "http://localhost:8000/v1").is_empty());
         }
-        assert_eq!(
-            select_model("my-future-model", examples).unwrap(),
-            "my-future-model"
-        );
-        assert_eq!(
-            select_model(
-                "2",
-                example_models(Provider::Openrouter, Provider::Openrouter.default_base())
-            )
-            .unwrap(),
-            "anthropic/claude-sonnet-5.5"
-        );
-        assert!(example_models(Provider::Openai, "http://localhost:8000/v1").is_empty());
+        assert_eq!(select_model("2", &[]).unwrap(), "2");
     }
 
     #[test]

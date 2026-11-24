@@ -53,7 +53,22 @@ Na Linuksie skrót jest dodawany przez tymczasową nakładkę Niri, bez edycji p
 - Wiele odpowiedzi: np. `1'2'3`, jako pełnowymiarowe komórki, nie miniaturowy tekst w jednej ikonie.
 - `-` — gotowy, `…` — analiza, `?` — brak rozpoznanej odpowiedzi, `!` — błąd.
 - Jedno żądanie naraz, bez kolejkowania kolejnych naciśnięć i bez automatycznych płatnych ponowień.
-- Model wybiera się w kreatorze. Musi istnieć w katalogu dostawcy i być dostępny dla Twojego klucza.
+- Model wybiera się numerem w kreatorze albo wpisując własny pełny identyfikator. Musi istnieć w katalogu dostawcy i być dostępny dla Twojego klucza.
+
+### Modele w kreatorze
+
+| Dostawca | Liczba | Wbudowane propozycje z obsługą obrazów |
+| --- | ---: | --- |
+| Anthropic | 5 | Haiku, Sonnet i Opus 5.5; Fable 5.2; starszy Sonnet 4.6 |
+| OpenAI | 6 | GPT-5.4 mini, GPT-5.4, GPT-5.2, GPT-6 Luna, GPT-6.2 Sol i Astra |
+| OpenRouter | 9 | Claude Haiku/Sonnet/Opus 5.5; GPT-5.4 mini, GPT-6 Luna, GPT-6.2 Sol; Gemini 3.8 Flash, 4 Hydrogen i 4 Carbon |
+| Gemini | 8 | 3.5 Flash-Lite, 3.8 Flash, 3.6 Flash, 3.1 Flash-Lite oraz 4 Hydrogen, Argon, Neon i Carbon |
+
+Dotychczasowe numery modeli i zapisane wybory pozostają bez zmian. Własne serwery wymagają identyfikatora z ich katalogu — nie pokazujemy im listy innego dostawcy.
+
+Listy sprawdzono 2026-11-24 w dokumentacji [Anthropic](https://platform.claude.com/docs/en/about-claude/models/overview), [OpenAI](https://developers.openai.com/api/docs/models), [Gemini](https://aistudio.google.com/docs/models) i [publicznym katalogu OpenRouter](https://openrouter.ai/api/v1/models). To nie jest sprawdzenie dostępu dla konkretnego klucza ani test płatnego API.
+
+**Fable 5.2 wymaga 30-dniowej retencji danych u Anthropic**, z wyjątkiem indywidualnie autoryzowanych organizacji ([zasady modelu](https://platform.claude.com/docs/en/models/fable-5-2/overview)). Kreator zaznacza to przy nazwie modelu.
 
 ## Prywatność i koszty
 
