@@ -142,6 +142,7 @@ def interactive_start(args, env, answers):
         assert os.waitstatus_to_exitcode(status) == 0, transcript
         assert step == len(answers), transcript
         assert b'test-secret-never-log' not in transcript, transcript
+        assert b'test-invisible' not in transcript, transcript
         assert 'Działa w tle'.encode() in transcript, transcript
         return transcript.decode()
     finally:
@@ -343,7 +344,8 @@ def main():
                 wizard_args = args + ['--niri-config', str(base)]
                 cases = [
                     ([('Dostawca [', 'claude'), ('Model: ', 'wizard-model'), ('Skrót [', ''), ('Odpowiedzi [', ''), ('Tryb [', ''),
-                      ('Klucz API (ukryty): ', ''), ('Klucz API (ukryty): ', 'test-secret-never-log')],
+                      ('Klucz API (ukryty): ', ''), ('Klucz API (ukryty): ', 'test-invisible\u200b-key'),
+                      ('Klucz API (ukryty): ', 'test-secret-never-log')],
                      'anthropic', 'wizard-model', 'Print', 'https://api.anthropic.com/v1'),
                     ([('Dostawca [', ''), ('Model [wizard-model]: ', ''), ('Skrót [Print]: ', ''), ('Odpowiedzi [', ''), ('Tryb [', ''),
                       ('Klucz API (ukryty): ', 'test-secret-never-log')],
@@ -366,7 +368,7 @@ def main():
                         cli('status')
                         cli('stop')
                         assert API.count == 2, 'Wizard must never capture or call an API'
-                    print('PASS: wizard without setup flags, first-run defaults, saved choices, empty key retry, provider/model/keybind changes, custom API URL')
+                    print('PASS: wizard without setup flags, first-run defaults, saved choices, empty/invalid key retry without echo, provider/model/keybind changes, custom API URL')
                     # Reproduce the reported typo; choose Opus by number without a real API call.
                     (runtime / 'settings.json').write_text(json.dumps(dict(
                         provider='anthropic', model='claud-opus-5-5',

@@ -11,7 +11,7 @@ Autor: [mirawer](https://github.com/mirawer).
 Albo otwórz **[Releases](https://github.com/mirawer/wtyczka/releases/latest)** → **Assets** → **screen-answer.exe**. Nie wybieraj „Source code”, jeśli chcesz gotowy program.
 
 1. Uruchom pobrany `.exe`. Nie wymaga instalacji Rusta, Pythona, lokalnego modelu ani pakietu VC++.
-2. W kreatorze wybierz dostawcę, model przyjmujący obrazy, skrót, jedną/wiele odpowiedzi i cyfry/kropki. Wklej klucz API dopiero w ostatnim, ukrytym polu.
+2. W kreatorze wybierz dostawcę, model przyjmujący obrazy, skrót, jedną/wiele odpowiedzi i cyfry/kropki. Wklej klucz API dopiero w ostatnim, ukrytym polu (Ctrl+V lub funkcja Wklej terminala), a potem naciśnij Enter. Schowek jest odczytywany tylko na żądanie Ctrl+V, nigdy zmieniany przez aplikację. Błędne znaki powodują ponowne pytanie o klucz zamiast zamknięcia programu.
 3. Po komunikacie „Działa w tle” możesz zamknąć terminal. Wyświetl całe pytanie z opcjami i naciśnij wybrany skrót.
 4. Ikony mogą początkowo być w rozwijanym zasobniku Windows. Ich widoczność i kolejność kontroluje system.
 

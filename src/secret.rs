@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use std::io;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -12,6 +12,15 @@ impl std::fmt::Display for EmptyKey {
     }
 }
 impl std::error::Error for EmptyKey {}
+
+#[derive(Debug)]
+pub struct InvalidKey(&'static str);
+impl std::fmt::Display for InvalidKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for InvalidKey {}
 
 /// Read an ASCII API key from the controlling terminal, never from redirected
 /// stdin. Terminal echo and signal processing are disabled before any prompt.
@@ -40,6 +49,10 @@ trait Console {
     /// A byte on Unix, or a UTF-16 code unit on Windows. Neither is decoded or
     /// included in errors; only printable ASCII is ever accepted.
     fn read_unit(&mut self) -> io::Result<Option<u32>>;
+    /// Only requested after an explicit Ctrl+V, never on normal typing.
+    fn read_paste(&mut self) -> io::Result<Option<Zeroizing<Vec<u16>>>> {
+        Ok(None)
+    }
     /// Write and flush only public text (the label and the final newline).
     fn write_public(&mut self, text: &str) -> io::Result<()>;
 }
@@ -96,17 +109,46 @@ fn read_edited_key(console: &mut impl Console) -> Result<Zeroizing<String>> {
                 bytes.zeroize(); // Ctrl+U clears the whole entry without echo.
                 len = 0;
             }
+            22 => {
+                let paste = console.read_paste()
+                    .map_err(|_| InvalidKey("Nie udało się odczytać tekstu do wklejenia. Spróbuj ponownie."))?
+                    .ok_or(InvalidKey("Brak tekstu do wklejenia. Użyj funkcji Wklej swojego terminala."))?;
+                append_paste(&mut bytes, &mut len, &paste)?;
+            }
             0x20..=0x7e => {
-                ensure!(
-                    len < MAX_KEY_LEN,
-                    "API key exceeds the 4096 character limit."
-                );
+                if len == MAX_KEY_LEN {
+                    return Err(InvalidKey("Klucz API przekracza limit 4096 znaków.").into());
+                }
                 bytes[len] = *unit as u8;
                 len += 1;
             }
-            _ => bail!("API key must contain printable ASCII characters only."),
+            _ => return Err(InvalidKey("Klucz API może zawierać tylko widoczne znaki ASCII. Wklej sam klucz, bez dodatkowego tekstu.").into()),
         }
     }
+}
+
+fn append_paste(bytes: &mut [u8; MAX_KEY_LEN], len: &mut usize, paste: &[u16]) -> Result<()> {
+    // Copy buttons sometimes append CR/LF. They are not part of the key and
+    // must not silently submit the prompt; the user still presses Enter.
+    let end = paste
+        .iter()
+        .rposition(|c| !matches!(c, 10 | 13))
+        .map_or(0, |i| i + 1);
+    let paste = &paste[..end];
+    if paste.is_empty() {
+        return Err(InvalidKey("Schowek nie zawiera klucza API.").into());
+    }
+    if paste.len() > MAX_KEY_LEN - *len {
+        return Err(InvalidKey("Klucz API przekracza limit 4096 znaków.").into());
+    }
+    if !paste.iter().all(|c| (0x20..=0x7e).contains(c)) {
+        return Err(InvalidKey("Klucz API może zawierać tylko widoczne znaki ASCII. Wklej sam klucz, bez dodatkowego tekstu.").into());
+    }
+    for unit in paste {
+        bytes[*len] = *unit as u8;
+        *len += 1;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -211,16 +253,26 @@ mod linux {
 #[cfg(windows)]
 mod windows {
     use super::Console;
-    use std::{io, ptr::null_mut};
+    use std::{
+        io,
+        ptr::null_mut,
+        thread,
+        time::{Duration, Instant},
+    };
     use windows_sys::Win32::{
         Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{
             CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
         },
-        System::Console::{
-            ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-            ENABLE_VIRTUAL_TERMINAL_INPUT, FlushConsoleInputBuffer, GetConsoleMode, ReadConsoleW,
-            SetConsoleMode, WriteConsoleW,
+        System::{
+            Console::{
+                ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+                ENABLE_VIRTUAL_TERMINAL_INPUT, FlushConsoleInputBuffer, GetConsoleMode,
+                ReadConsoleW, SetConsoleMode, WriteConsoleW,
+            },
+            DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard},
+            Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+            Ole::CF_UNICODETEXT,
         },
     };
     use zeroize::Zeroizing;
@@ -256,6 +308,7 @@ mod windows {
         output: Handle,
         original: u32,
         needs_restore: bool,
+        clipboard_reader: fn() -> io::Result<Zeroizing<Vec<u16>>>,
     }
     impl Terminal {
         pub(super) fn open_hidden() -> io::Result<Self> {
@@ -273,6 +326,7 @@ mod windows {
                 output,
                 original,
                 needs_restore: true,
+                clipboard_reader: read_clipboard,
             };
             let hidden = original
                 & !(ENABLE_ECHO_INPUT
@@ -329,6 +383,10 @@ mod windows {
             })
         }
 
+        fn read_paste(&mut self) -> io::Result<Option<Zeroizing<Vec<u16>>>> {
+            (self.clipboard_reader)().map(Some)
+        }
+
         fn write_public(&mut self, text: &str) -> io::Result<()> {
             // This buffer contains only the public prompt/newline, never input.
             let text: Vec<u16> = text.encode_utf16().collect();
@@ -365,6 +423,61 @@ mod windows {
             let _ = self.restore();
         }
     }
+
+    /// Read-only, on-demand clipboard access for consoles that deliver Ctrl+V
+    /// as U+0016 in raw input mode. Never clear or replace clipboard contents.
+    fn read_clipboard() -> io::Result<Zeroizing<Vec<u16>>> {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while unsafe { OpenClipboard(null_mut()) } == 0 {
+            if Instant::now() >= deadline {
+                return Err(io::Error::last_os_error());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        struct Clipboard;
+        impl Drop for Clipboard {
+            fn drop(&mut self) {
+                unsafe { CloseClipboard() };
+            }
+        }
+        let _clipboard = Clipboard;
+        let handle = unsafe { GetClipboardData(u32::from(CF_UNICODETEXT)) };
+        if handle.is_null() {
+            return Err(io::Error::other("No Unicode text in clipboard"));
+        }
+        // Never allocate/read an unbounded clipboard value. The extra units
+        // allow a maximum-length key followed by CR/LF and its terminating NUL.
+        let count = (unsafe { GlobalSize(handle) } / size_of::<u16>()).min(super::MAX_KEY_LEN + 3);
+        if count == 0 {
+            return Err(io::Error::other("Empty clipboard text"));
+        }
+        let data = unsafe { GlobalLock(handle) };
+        if data.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        struct Locked(windows_sys::Win32::Foundation::HGLOBAL);
+        impl Drop for Locked {
+            fn drop(&mut self) {
+                unsafe { GlobalUnlock(self.0) };
+            }
+        }
+        let _locked = Locked(handle);
+        // CF_UNICODETEXT is a GlobalAlloc-backed UTF-16 buffer. Its allocation
+        // size is checked above and it remains locked while these units are read.
+        let units = unsafe { std::slice::from_raw_parts(data.cast::<u16>(), count) };
+        let end = units
+            .iter()
+            .position(|c| *c == 0)
+            .ok_or_else(|| io::Error::other("Clipboard text is too long or unterminated"))?;
+        let mut copy = Zeroizing::new(Vec::new());
+        copy.try_reserve_exact(end)
+            .map_err(|_| io::Error::other("Cannot allocate paste buffer"))?;
+        copy.extend_from_slice(&units[..end]);
+        Ok(copy)
+    }
+
+    #[cfg(test)]
+    mod tests;
 }
 
 #[cfg(test)]
@@ -379,6 +492,8 @@ mod tests {
         output: String,
         fail_read: bool,
         fail_write: bool,
+        paste: Option<Zeroizing<Vec<u16>>>,
+        paste_reads: usize,
     }
     impl FakeConsole {
         fn new(input: impl IntoIterator<Item = u32>) -> Self {
@@ -387,6 +502,8 @@ mod tests {
                 output: String::new(),
                 fail_read: false,
                 fail_write: false,
+                paste: None,
+                paste_reads: 0,
             }
         }
         fn ascii(input: &[u8]) -> Self {
@@ -404,6 +521,11 @@ mod tests {
             }
             Ok(self.input.pop_front())
         }
+        fn read_paste(&mut self) -> io::Result<Option<Zeroizing<Vec<u16>>>> {
+            assert_eq!(self.output, LABEL);
+            self.paste_reads += 1;
+            Ok(self.paste.take())
+        }
         fn write_public(&mut self, text: &str) -> io::Result<()> {
             if self.fail_write {
                 return Err(io::Error::other("injected write failure"));
@@ -419,6 +541,67 @@ mod tests {
         assert_eq!(
             edit_key(&mut console, LABEL).unwrap().as_str(),
             "sk-instant-paste_123"
+        );
+        assert_eq!(console.output, format!("{LABEL}\r\n"));
+    }
+
+    #[test]
+    fn explicit_ctrl_v_pastes_without_echo_or_automatic_enter() {
+        let mut console = FakeConsole::ascii(b"\x16Z\r");
+        console.paste = Some(Zeroizing::new("test-key\r\n".encode_utf16().collect()));
+        assert_eq!(edit_key(&mut console, LABEL).unwrap().as_str(), "test-keyZ");
+        assert_eq!(console.paste_reads, 1);
+        assert_eq!(console.output, format!("{LABEL}\r\n"));
+    }
+
+    #[test]
+    fn ordinary_typing_never_reads_clipboard() {
+        let mut console = FakeConsole::ascii(b"test-key\r");
+        assert_eq!(edit_key(&mut console, LABEL).unwrap().as_str(), "test-key");
+        assert_eq!(console.paste_reads, 0);
+    }
+
+    #[test]
+    fn clipboard_text_is_validated_without_disclosing_it() {
+        for paste in [
+            "private\nsecond",
+            "private\u{200b}",
+            "private\t",
+            "private\0",
+            "\r\n",
+            "",
+        ] {
+            let mut console = FakeConsole::ascii(b"\x16\r");
+            console.paste = Some(Zeroizing::new(paste.encode_utf16().collect()));
+            let err = edit_key(&mut console, LABEL).unwrap_err();
+            assert!(err.is::<InvalidKey>());
+            assert!(!err.to_string().contains("private"));
+            assert_eq!(console.output, format!("{LABEL}\r\n"));
+        }
+    }
+
+    #[test]
+    fn clipboard_length_limit_includes_already_typed_characters() {
+        let mut console = FakeConsole::ascii(b"\x16\r");
+        console.paste = Some(Zeroizing::new(vec![65; MAX_KEY_LEN]));
+        assert_eq!(edit_key(&mut console, LABEL).unwrap().len(), MAX_KEY_LEN);
+        let mut console = FakeConsole::ascii(b"X\x16\r");
+        console.paste = Some(Zeroizing::new(vec![65; MAX_KEY_LEN]));
+        assert!(
+            edit_key(&mut console, LABEL)
+                .unwrap_err()
+                .is::<InvalidKey>()
+        );
+        assert_eq!(console.output, format!("{LABEL}\r\n"));
+    }
+
+    #[test]
+    fn missing_clipboard_text_is_recoverable_and_never_echoed() {
+        let mut console = FakeConsole::ascii(b"\x16\r");
+        assert!(
+            edit_key(&mut console, LABEL)
+                .unwrap_err()
+                .is::<InvalidKey>()
         );
         assert_eq!(console.output, format!("{LABEL}\r\n"));
     }

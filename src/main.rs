@@ -284,6 +284,10 @@ async fn start(cli: Cli, runtime: PathBuf) -> Result<()> {
                 println!("Klucz nie może być pusty. Wklej go tutaj i naciśnij Enter.");
                 continue;
             }
+            Err(err) if err.is::<secret::InvalidKey>() => {
+                eprintln!("{err}\nSpróbuj ponownie. Wpisywane znaki pozostają ukryte.");
+                continue;
+            }
             Err(err) => return Err(err),
         };
         if !key.trim().is_empty() {
