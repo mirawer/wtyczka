@@ -3,7 +3,6 @@ name: Build and test
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -24,6 +23,14 @@ jobs:
           rustup target add x86_64-unknown-linux-musl --toolchain 1.95.0
           sudo apt-get update
           sudo apt-get install -y musl-tools
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-1.95-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-1.95-
       - name: Unit tests and Clippy (no external API)
         run: |
           cargo +1.95.0 test --locked
@@ -61,25 +68,27 @@ jobs:
           persist-credentials: false
       - name: Toolchain
         run: |
-          rustup toolchain install 1.95.0 --profile minimal
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-1.95-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-1.95-
       - name: Build and native Windows unit/IPC tests (no external API)
         run: |
           cargo +1.95.0 build --locked --release --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +1.95.0 test --locked --release --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.95.0 clippy --locked --release --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/x86_64-pc-windows-msvc/release/screen-answer.exe dist/screen-answer.exe
-          $Events = cargo +1.95.0 test --locked --release --target x86_64-pc-windows-msvc --no-run --message-format=json
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $Test = @($Events | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
-            $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable
-          })
-          if ($Test.Count -ne 1) { throw 'Expected one Windows test executable' }
-          Copy-Item $Test[0].executable dist/screen-answer-tests.exe
-          ./dist/screen-answer.exe --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/test-windows.ps1 -Executable ./dist/screen-answer.exe
       - name: Verify Windows system DLL imports only
         run: |
           $Vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
@@ -90,20 +99,19 @@ jobs:
           $Allowed = @('kernel32.dll', 'kernelbase.dll', 'ntdll.dll', 'user32.dll', 'gdi32.dll',
             'ws2_32.dll', 'advapi32.dll', 'bcrypt.dll', 'bcryptprimitives.dll', 'shell32.dll',
             'userenv.dll', 'ucrtbase.dll', 'ole32.dll', 'synchronization.dll')
-          foreach ($File in @('dist/screen-answer.exe', 'dist/screen-answer-tests.exe')) {
-            $Report = & $Dumpbin /DEPENDENTS $File
-            if ($LASTEXITCODE -ne 0) { throw "Cannot inspect $File" }
-            $Dlls = @($Report | ForEach-Object {
-              if ($_ -match '^\s+([A-Za-z0-9._-]+\.dll)\s*$') { $Matches[1].ToLowerInvariant() }
-            })
-            if (-not $Dlls.Count) { throw "No DLL imports found in $File" }
-            foreach ($Dll in $Dlls) {
-              if ($Dll -notin $Allowed -and $Dll -notlike 'api-ms-win-*.dll' -and $Dll -notlike 'ext-ms-win-*.dll') {
-                throw "Unexpected runtime DLL in ${File}: $Dll"
-              }
+          $File = 'dist/screen-answer.exe'
+          $Report = & $Dumpbin /DEPENDENTS $File
+          if ($LASTEXITCODE -ne 0) { throw "Cannot inspect $File" }
+          $Dlls = @($Report | ForEach-Object {
+            if ($_ -match '^\s+([A-Za-z0-9._-]+\.dll)\s*$') { $Matches[1].ToLowerInvariant() }
+          })
+          if (-not $Dlls.Count) { throw "No DLL imports found in $File" }
+          foreach ($Dll in $Dlls) {
+            if ($Dll -notin $Allowed -and $Dll -notlike 'api-ms-win-*.dll' -and $Dll -notlike 'ext-ms-win-*.dll') {
+              throw "Unexpected runtime DLL in ${File}: $Dll"
             }
-            Write-Host "$File uses Windows system DLLs only: $($Dlls -join ', ')"
           }
+          Write-Host "$File uses Windows system DLLs only: $($Dlls -join ', ')"
           Get-FileHash dist/screen-answer.exe -Algorithm SHA256
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

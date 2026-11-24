@@ -433,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_is_asked_before_display_and_remembered() {
+    fn selection_and_display_are_ordered_remembered_and_editable() {
         let (settings, prompts, text) = run(
             &["screen-answer"],
             None,
@@ -444,36 +444,25 @@ mod tests {
         assert!(prompts[3].starts_with("Odpowiedzi ["));
         assert!(prompts[4].starts_with("Tryb ["));
         assert!(text.contains("1'2"));
-        let (again, _, _) = run(&["screen-answer"], Some(&settings), &["", "", "", "", ""]);
-        assert_eq!(again.selection, SelectionMode::Multiple);
-        let (single, _, _) = run(
-            &["screen-answer"],
-            Some(&settings),
-            &["", "", "", "wrong", "single", ""],
-        );
-        assert_eq!(single.selection, SelectionMode::Single);
-    }
-
-    #[test]
-    fn dots_mode_can_be_selected_and_remembered_without_flags() {
-        let (settings, _, text) = run(
-            &["screen-answer"],
-            None,
-            &["", "vision-model", "", "", "bad", "2"],
-        );
-        assert_eq!(settings.mode, AnswerMode::Dots);
         assert!(text.contains("5 = jedna nad kwadratem czterech"));
         let (again, prompts, _) = run(&["screen-answer"], Some(&settings), &["", "", "", "", ""]);
+        assert_eq!(again.selection, SelectionMode::Multiple);
         assert_eq!(again.mode, AnswerMode::Dots);
         assert!(prompts.last().unwrap().contains("2 — kropki 1–6"));
-        let (digits, _, _) = run(&["screen-answer"], Some(&settings), &["", "", "", "", "1"]);
-        assert_eq!(digits.mode, AnswerMode::Digits);
+        let (changed, _, _) = run(
+            &["screen-answer"],
+            Some(&settings),
+            &["", "", "", "wrong", "single", "bad", "digits"],
+        );
+        assert_eq!(changed.selection, SelectionMode::Single);
+        assert_eq!(changed.mode, AnswerMode::Digits);
     }
 
     #[test]
-    fn older_settings_default_to_digits() {
+    fn older_settings_default_to_single_digits() {
         let settings: Settings = serde_json::from_str(r#"{"provider":"anthropic","model":"vision-model","base_url":"https://api.anthropic.com/v1","keybind":"Print"}"#).unwrap();
         assert_eq!(settings.mode, AnswerMode::Digits);
+        assert_eq!(settings.selection, SelectionMode::Single);
     }
 
     #[test]
@@ -524,35 +513,41 @@ mod tests {
     }
 
     #[test]
-    fn first_run_defaults_to_anthropic_and_print() {
-        let (settings, prompts, text) =
-            run(&["screen-answer"], None, &["", "vision-model", "", "", ""]);
-        assert_eq!(settings.provider, Provider::Anthropic);
-        assert_eq!(settings.model, "vision-model");
-        assert_eq!(settings.keybind, "Print");
-        assert_eq!(prompts.len(), 5);
-        assert_eq!(settings.mode, AnswerMode::Digits);
-        assert!(text.contains("9 opcji (A–I)"));
-    }
-
-    #[test]
-    fn always_asks_even_when_settings_are_saved() {
-        let (settings, prompts, _) = run(&["screen-answer"], Some(&saved()), &["", "", "", "", ""]);
-        assert_eq!(settings.model, "saved-vision-model");
-        assert_eq!(settings.keybind, "Ctrl+Shift+F8");
-        assert_eq!(prompts.len(), 5);
-        assert!(prompts[1].contains("[saved-vision-model]"));
-    }
-
-    #[test]
-    fn can_change_model_and_keybind_without_flags() {
-        let (settings, _, _) = run(
-            &["screen-answer"],
-            Some(&saved()),
-            &["claude", "new-model", "PrintScreen", "", ""],
-        );
-        assert_eq!(settings.model, "new-model");
-        assert_eq!(settings.keybind, "Print");
+    fn wizard_defaults_saved_choices_and_edits() {
+        let saved = saved();
+        for (previous, answers, model, keybind, model_prompt) in [
+            (
+                None,
+                ["", "vision-model", "", "", ""],
+                "vision-model",
+                "Print",
+                "Model: ",
+            ),
+            (
+                Some(&saved),
+                ["", "", "", "", ""],
+                "saved-vision-model",
+                "Ctrl+Shift+F8",
+                "Model [saved-vision-model]: ",
+            ),
+            (
+                Some(&saved),
+                ["claude", "new-model", "PrintScreen", "", ""],
+                "new-model",
+                "Print",
+                "Model [saved-vision-model]: ",
+            ),
+        ] {
+            let (settings, prompts, text) = run(&["screen-answer"], previous, &answers);
+            assert_eq!(settings.provider, Provider::Anthropic);
+            assert_eq!(settings.model, model);
+            assert_eq!(settings.keybind, keybind);
+            assert_eq!(settings.mode, AnswerMode::Digits);
+            assert_eq!(settings.selection, SelectionMode::Single);
+            assert_eq!(prompts.len(), 5);
+            assert_eq!(prompts[1], model_prompt);
+            assert!(text.contains("9 opcji (A–I)"));
+        }
     }
 
     #[test]

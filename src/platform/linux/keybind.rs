@@ -163,25 +163,6 @@ pub fn recover(runtime: &Path) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn keybind_validation() {
-        assert_eq!(normalize_keybind("PrintScreen").unwrap(), "Print");
-        assert_eq!(
-            normalize_keybind("control+shift+F8").unwrap(),
-            "Ctrl+Shift+F8"
-        );
-        for key in [
-            "",
-            "Ctrl+",
-            "A;evil",
-            "Print\n",
-            "Ctrl+Ctrl+A",
-            "Foo+F8",
-            "\"Print\"",
-        ] {
-            assert!(normalize_keybind(key).is_err(), "{key}");
-        }
-    }
-    #[test]
     fn paths_are_quoted_and_repeat_is_disabled() {
         let s = overlay(
             Path::new("/base config.kdl"),

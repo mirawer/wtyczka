@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use image::{ExtendedColorType, codecs::jpeg::JpegEncoder};
+use image::{GenericImageView, Rgb, codecs::jpeg::JpegEncoder};
 use std::{
     ffi::c_void,
     io::{self, Write},
@@ -37,7 +37,7 @@ use windows_sys::Win32::{
 };
 
 const MAX_IMAGE: usize = 4 * 1024 * 1024;
-// Includes 8K UHD, while bounding both the DIB and the RGB allocation.
+// Includes 8K UHD, while bounding the single 32-bit DIB allocation.
 const MAX_PIXELS: usize = 40_000_000;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
 // A timed-out spawn_blocking cannot be killed. Keep its permit until it exits,
@@ -65,9 +65,7 @@ pub async fn capture() -> Result<Vec<u8>> {
                 Ok(())
             };
             check_deadline()?;
-            let frame = capture_frame(&check_deadline)?;
-            check_deadline()?;
-            let jpeg = encode_jpeg(&frame)?;
+            let jpeg = capture_jpeg(&check_deadline)?;
             check_deadline()?;
             // Also refuse if the session switched desktops while encoding.
             check_environment()?;
@@ -297,12 +295,32 @@ impl Geometry {
     }
 }
 
-struct Frame {
+/// Borrow GDI's top-down pixels directly instead of allocating a second RGB
+/// image (about 95 MiB saved at 8K). BI_RGB's reserved alpha is ignored.
+struct BgraImage<'a> {
     geometry: Geometry,
-    rgb: Vec<u8>,
+    pixels: &'a [u8],
+}
+impl GenericImageView for BgraImage<'_> {
+    type Pixel = Rgb<u8>;
+
+    fn dimensions(&self) -> (u32, u32) {
+        (self.geometry.width as u32, self.geometry.height as u32)
+    }
+
+    fn get_pixel(&self, x: u32, y: u32) -> Self::Pixel {
+        let (width, height) = self.dimensions();
+        assert!(x < width && y < height);
+        let offset = (y as usize * width as usize + x as usize) * 4;
+        Rgb([
+            self.pixels[offset + 2],
+            self.pixels[offset + 1],
+            self.pixels[offset],
+        ])
+    }
 }
 
-fn capture_frame(check_deadline: &impl Fn() -> Result<()>) -> Result<Frame> {
+fn capture_jpeg(check_deadline: &impl Fn() -> Result<()>) -> Result<Vec<u8>> {
     check_environment()?;
     let _dpi = DpiContext::physical_pixels()?;
     unsafe {
@@ -347,28 +365,14 @@ fn capture_frame(check_deadline: &impl Fn() -> Result<()>) -> Result<Frame> {
         check_deadline()?;
         // The live DIB owns precisely this checked, top-down 32-bit buffer.
         let bgra = std::slice::from_raw_parts(surface.bits.cast::<u8>(), geometry.bgra_len);
-        let rgb = bgra_to_rgb(bgra)?;
         ensure!(
-            rgb.iter().any(|&channel| channel != 0),
+            bgra.chunks_exact(4)
+                .any(|pixel| pixel[..3].iter().any(|&c| c != 0)),
             "Capture is entirely black; desktop may be unavailable or protected."
         );
-        Ok(Frame { geometry, rgb })
+        // The surface stays alive and unchanged for the whole encode.
+        encode_jpeg(bgra, geometry)
     }
-}
-
-fn bgra_to_rgb(bgra: &[u8]) -> Result<Vec<u8>> {
-    ensure!(bgra.len().is_multiple_of(4), "Incomplete BGRA pixel.");
-    let len = (bgra.len() / 4)
-        .checked_mul(3)
-        .context("RGB buffer size overflow.")?;
-    let mut rgb = Vec::new();
-    rgb.try_reserve_exact(len)
-        .context("Cannot allocate RGB capture buffer.")?;
-    for pixel in bgra.chunks_exact(4) {
-        // BI_RGB's reserved alpha byte is not meaningful; do not composite it.
-        rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
-    }
-    Ok(rgb)
 }
 
 struct BoundedJpeg(Vec<u8>);
@@ -385,19 +389,15 @@ impl Write for BoundedJpeg {
     }
 }
 
-fn encode_jpeg(frame: &Frame) -> Result<Vec<u8>> {
+fn encode_jpeg(pixels: &[u8], geometry: Geometry) -> Result<Vec<u8>> {
+    ensure!(pixels.len() == geometry.bgra_len, "Incomplete BGRA image.");
     let mut output = BoundedJpeg(Vec::new());
     output
         .0
         .try_reserve_exact(MAX_IMAGE)
         .context("Cannot allocate JPEG output buffer.")?;
     JpegEncoder::new_with_quality(&mut output, 85)
-        .encode(
-            &frame.rgb,
-            frame.geometry.width as u32,
-            frame.geometry.height as u32,
-            ExtendedColorType::Rgb8,
-        )
+        .encode_image(&BgraImage { geometry, pixels })
         .context("Cannot encode native-resolution JPEG at quality 85 (maximum 4 MiB).")?;
     Ok(output.0)
 }
@@ -439,9 +439,20 @@ mod tests {
         let bgra = [
             3, 2, 1, 0, 6, 5, 4, 255, 9, 8, 7, 12, 12, 11, 10, 0, 15, 14, 13, 0, 18, 17, 16, 255,
         ];
-        assert_eq!(bgra_to_rgb(&bgra).unwrap(), (1u8..=18).collect::<Vec<_>>());
-        assert_eq!(bgra_to_rgb(&[0, 0, 0, 255]).unwrap(), [0, 0, 0]);
-        assert!(bgra_to_rgb(&[1, 2, 3]).is_err());
+        let geometry = Geometry::from_edges(0, 0, 3, 2).unwrap();
+        let view = BgraImage {
+            geometry,
+            pixels: &bgra,
+        };
+        // Read pixels in row order; alpha never affects the RGB channels.
+        let mut actual = Vec::new();
+        for y in 0..2 {
+            for x in 0..3 {
+                actual.extend(view.get_pixel(x, y).0);
+            }
+        }
+        assert_eq!(actual, (1u8..=18).collect::<Vec<_>>());
+        assert!(encode_jpeg(&[1, 2, 3], geometry).is_err());
     }
 
     #[test]
@@ -456,11 +467,8 @@ mod tests {
 
     #[test]
     fn jpeg_has_native_dimensions() {
-        let frame = Frame {
-            geometry: Geometry::from_edges(0, 0, 3, 2).unwrap(),
-            rgb: vec![127; 3 * 2 * 3],
-        };
-        let encoded = encode_jpeg(&frame).unwrap();
+        let geometry = Geometry::from_edges(0, 0, 3, 2).unwrap();
+        let encoded = encode_jpeg(&[127; 3 * 2 * 4], geometry).unwrap();
         assert!(encoded.starts_with(&[0xff, 0xd8, 0xff]));
         assert!(encoded.len() <= MAX_IMAGE);
         // Decoder is enabled by the same image/jpeg feature as the encoder.

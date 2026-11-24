@@ -1,6 +1,5 @@
 param(
     [string]$Executable = "",
-    [string]$TestExecutable = "",
     [switch]$ShowTray
 )
 
@@ -25,7 +24,6 @@ if (-not $Executable -or -not (Test-Path -LiteralPath $Executable -PathType Leaf
     throw "Missing screen-answer.exe. Pass -Executable with its path."
 }
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
-if (-not $TestExecutable) { $TestExecutable = Join-Path $Root "bin/screen-answer-tests.exe" }
 
 function Invoke-Checked {
     param([string]$File, [string[]]$Arguments)
@@ -35,13 +33,7 @@ function Invoke-Checked {
 
 Invoke-Checked $Executable @("--version")
 Invoke-Checked $Executable @("--help")
-if (Test-Path -LiteralPath $TestExecutable -PathType Leaf) {
-    # Pure rendering/parser tests plus native private-directory/pipe tests.
-    # Images and API responses in these tests are synthetic; HTTP is loopback only.
-    Invoke-Checked ((Resolve-Path -LiteralPath $TestExecutable).Path) @("--test-threads=1")
-} else {
-    Write-Warning "Unit-test executable missing: native unit/IPC tests were NOT run."
-}
+# Unit/IPC tests run in CI (or `cargo test`), not in the end-user download.
 
 if ($ShowTray) {
     Invoke-Checked $Executable @("doctor")

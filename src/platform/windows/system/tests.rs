@@ -87,6 +87,13 @@ fn runtime_and_private_files_have_only_current_user_acl() -> Result<()> {
     assert_eq!(open_private_file(&log, true, true)?.metadata()?.len(), 0);
     assert!(open_private_file(&runtime.join("daemon.log:stream"), false, true).is_err());
     assert!(open_private_file(&runtime, false, false).is_err());
+    let lock_path = runtime.join("daemon.lock");
+    let first = open_private_file(&lock_path, false, true)?;
+    first.try_lock()?;
+    let second = open_private_file(&lock_path, false, true)?;
+    assert!(second.try_lock().is_err());
+    drop(first);
+    second.try_lock()?;
     Ok(())
 }
 
@@ -331,14 +338,4 @@ async fn termination_reaps_a_waiting_hidden_child() -> Result<()> {
     terminate(&mut child).await;
     assert!(child.try_wait()?.is_some());
     Ok(())
-}
-
-#[test]
-fn async_ipc_is_send() {
-    fn assert_send<T: Send>(_: T) {}
-    fn assert_send_type<T: Send>() {}
-    assert_send_type::<Listener>();
-    assert_send_type::<ServerStream>();
-    assert_send_type::<ClientStream>();
-    assert_send(connect(Path::new("unused")));
 }

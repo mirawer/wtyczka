@@ -42,7 +42,7 @@ mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}"
 ./screen-answer-linux-x86_64 --runtime-dir "${XDG_STATE_HOME:-$HOME/.local/state}/screen-answer" stop
 ```
 
-Alternatywnie sklonuj kod i uruchom `./screen-answer`; launcher buduje release przy pierwszym starcie (wymaga Rust/Cargo i kompilatora C). W katalogu projektu stan jest przechowywany w `.runtime/`.
+Alternatywnie sklonuj kod i uruchom `./screen-answer`; launcher buduje release przy pierwszym starcie (wymaga Rust/Cargo 1.89+ i kompilatora C). W katalogu projektu stan jest przechowywany w `.runtime/`.
 
 Na Linuksie skrót jest dodawany przez tymczasową nakładkę Niri, bez edycji pliku bazowego. Normalne zatrzymanie przywraca bazę. Po `kill -9` użyj `restore-keybind` z tym samym `--runtime-dir` albo uruchom program ponownie. Nie usuwaj katalogu stanu przed przywróceniem skrótu.
 
@@ -75,12 +75,12 @@ GitHub Actions buduje Linux x86_64/musl i Windows x86_64/MSVC ze statycznym CRT 
 
 Testy integracyjne Linuksa: `python3 tests/smoke.py` — wymagają aktywnego sesyjnego D-Bus z zasobnikiem; używają sztucznych `niri`/`grim` i lokalnego HTTP, bez rzeczywistych zrzutów. Można wskazać binarkę przez `SCREEN_ANSWER_BIN`.
 
-Testy i pokazy Windows, po pobraniu obu plików `.exe` z Releases do katalogu projektu:
+Ręczny pokaz zasobnika Windows, po pobraniu `screen-answer.exe` do katalogu projektu:
 
 ```powershell
-.\scripts\test-windows.ps1 -Executable .\screen-answer.exe -TestExecutable .\screen-answer-tests.exe -ShowTray
+.\scripts\test-windows.ps1 -Executable .\screen-answer.exe -ShowTray
 ```
 
-Sama aplikacja nie potrzebuje skryptu ani pliku testów.
+Sama aplikacja nie potrzebuje skryptu. Testy jednostkowe i IPC pozostają w kodzie/CI (`cargo test`), nie są osobną aplikacją w Releases.
 
 **Ograniczenie weryfikacji:** testy CI nie potwierdzają wyglądu zasobnika, fizycznego skrótu i przechwytywania monitora na interaktywnym Windows 10/11. Nie potwierdzają też trafności ani dostępności rzeczywistych usług AI.

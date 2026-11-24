@@ -11,7 +11,6 @@ use anyhow::{Context, Result, bail};
 use api::{Api, Provider};
 use clap::{Parser, Subcommand};
 use display::State;
-use fs2::FileExt;
 use mode::{AnswerMode, SelectionMode};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -125,7 +124,7 @@ struct Startup {
 
 fn lock(runtime: &Path) -> Result<File> {
     let lock = platform::open_private_file(&runtime.join("daemon.lock"), false, true)?;
-    lock.try_lock_exclusive()
+    lock.try_lock()
         .context("Program już działa. Najpierw użyj stop.")?;
     Ok(lock)
 }
@@ -257,6 +256,7 @@ async fn start(cli: Cli, runtime: PathBuf) -> Result<()> {
         }
     }
     let os_startup = platform::prepare_start(&cli, &runtime)?;
+    api::endpoint_url(settings.provider, &settings.model, &settings.base_url)?;
     println!(
         "Dostawca: {:?}; model: {}; adres: {}",
         settings.provider, settings.model, settings.base_url
@@ -278,32 +278,14 @@ async fn start(cli: Cli, runtime: PathBuf) -> Result<()> {
     );
     println!("\n6/6 — Teraz wklej klucz API. Wpisywane znaki nie będą widoczne.");
     let key = loop {
-        let key = match secret::prompt_key("Klucz API (ukryty): ") {
-            Ok(key) => key,
-            Err(err) if err.is::<secret::EmptyKey>() => {
-                println!("Klucz nie może być pusty. Wklej go tutaj i naciśnij Enter.");
-                continue;
-            }
+        match secret::prompt_key("Klucz API (ukryty): ") {
+            Ok(key) => break key,
             Err(err) if err.is::<secret::InvalidKey>() => {
                 eprintln!("{err}\nSpróbuj ponownie. Wpisywane znaki pozostają ukryte.");
-                continue;
             }
             Err(err) => return Err(err),
-        };
-        if !key.trim().is_empty() {
-            break key;
         }
-        println!("Klucz nie może być pusty. Wklej go tutaj i naciśnij Enter.");
     };
-    Api::new(
-        settings.provider,
-        settings.model.clone(),
-        &settings.base_url,
-        Zeroizing::new(key.to_string()),
-        cli.timeout,
-    )?
-    .with_mode(settings.mode)
-    .with_selection(settings.selection);
     let startup = Startup {
         settings,
         timeout: cli.timeout,
@@ -371,12 +353,20 @@ async fn client(runtime: &Path, request: &str) -> Result<()> {
     .context("Proces nie odpowiedział na polecenie.")?
 }
 
-type Job = tokio::task::JoinHandle<()>;
+type Job = tokio::task::JoinHandle<Result<answer::Answer>>;
+
+async fn finish_job(job: &mut Option<Job>) -> Result<answer::Answer> {
+    match job {
+        Some(job) => job
+            .await
+            .map_err(|_| anyhow::anyhow!("Przerwany proces analizy."))?,
+        None => std::future::pending().await,
+    }
+}
 
 async fn trigger(
     api: &std::sync::Arc<Api>,
     ui: &platform::Ui,
-    results: &tokio::sync::mpsc::Sender<Result<api::Answer>>,
     seconds: u64,
     job: &mut Option<Job>,
     last: &mut Option<tokio::time::Instant>,
@@ -387,15 +377,13 @@ async fn trigger(
     *last = Some(tokio::time::Instant::now());
     ui.update(State::Busy).await?;
     let api = api.clone();
-    let tx = results.clone();
     *job = Some(tokio::spawn(async move {
-        let result = timeout(Duration::from_secs(seconds + 20), async {
+        timeout(Duration::from_secs(seconds + 20), async {
             let image = platform::capture::capture().await?;
             api.solve(&image).await
         })
         .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("Upłynął limit czasu analizy.")));
-        let _ = tx.send(result).await;
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("Upłynął limit czasu analizy.")))
     }));
     Ok(true)
 }
@@ -431,7 +419,6 @@ async fn run(
     )
     .await
     .context("Nie można uruchomić wskaźnika lub zarejestrować skrótu.")?;
-    let (results_tx, mut results_rx) = tokio::sync::mpsc::channel(1);
     let mut job: Option<Job> = None;
     let mut stop_client = None;
     let mut last_trigger = None;
@@ -449,36 +436,42 @@ async fn run(
             println!("Działa. Ctrl+C kończy program; odpowiedź jest wyłącznie na pasku.");
         }
         loop {
-        tokio::select! {
-            biased;
-            _=shutdown.wait()=>break,
-            result=results_rx.recv(),if job.is_some()=>{
-                job=None;
-                let state=match result.context("Przerwany kanał wyników.")? {
-                    Ok(answer)=>State::Answer(answer),
-                    Err(err)=>{eprintln!("Analiza nie powiodła się: {err:#}");State::Error}
-                };
-                ui.update(state).await?;
-            },
-            connection=listener.accept()=>{
-                let stream=connection?;
-                let mut reader=BufReader::new(stream);let mut line=Vec::new();
-                let received=timeout(Duration::from_millis(300),(&mut reader).take(64).read_until(b'\n',&mut line)).await;
-                if !matches!(received,Ok(Ok(_))) {continue;}
-                let command=std::str::from_utf8(&line).unwrap_or("").trim();
-                let mut stream=reader.into_inner();
-                let response=match command {
-                    "stop"=>{stop_client=Some(stream);break;},
-                    "status"=>"OK\n",
-                    "trigger"=>if trigger(&api,&ui,&results_tx,startup.timeout,&mut job,&mut last_trigger).await? {"OK\n"} else {"BUSY\n"},
-                    _=>"ERROR\n",
-                };
-                let _=stream.write_all(response.as_bytes()).await;
-            },
-            Some(())=triggers_rx.recv()=>{
-                trigger(&api,&ui,&results_tx,startup.timeout,&mut job,&mut last_trigger).await?;
-            },
-        }
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => break,
+                result = finish_job(&mut job) => {
+                    job = None;
+                    let state = match result {
+                        Ok(answer) => State::Answer(answer),
+                        Err(err) => {
+                            eprintln!("Analiza nie powiodła się: {err:#}");
+                            State::Error
+                        }
+                    };
+                    ui.update(state).await?;
+                },
+                connection = listener.accept() => {
+                    let mut reader = BufReader::new(connection?);
+                    let mut line = Vec::new();
+                    let received = timeout(Duration::from_millis(300),
+                        (&mut reader).take(64).read_until(b'\n', &mut line)).await;
+                    if !matches!(received, Ok(Ok(_))) { continue; }
+                    let command = std::str::from_utf8(&line).unwrap_or("").trim();
+                    let mut stream = reader.into_inner();
+                    let response = match command {
+                        "stop" => { stop_client = Some(stream); break; },
+                        "status" => "OK\n",
+                        "trigger" => if trigger(&api, &ui, startup.timeout, &mut job, &mut last_trigger).await? {
+                            "OK\n"
+                        } else { "BUSY\n" },
+                        _ => "ERROR\n",
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                },
+                Some(()) = triggers_rx.recv() => {
+                    trigger(&api, &ui, startup.timeout, &mut job, &mut last_trigger).await?;
+                },
+            }
         }
         Ok(())
     }.await;
@@ -496,4 +489,26 @@ async fn run(
         let _ = stream.write_all(response).await;
     }
     result.and(restored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn worker_completion_and_panic_are_both_observed() {
+        let mut job: Option<Job> = Some(tokio::spawn(async { Ok(answer::Answer::Choice(2)) }));
+        assert_eq!(
+            finish_job(&mut job).await.unwrap(),
+            answer::Answer::Choice(2)
+        );
+        job = Some(tokio::spawn(async { panic!("synthetic worker failure") }));
+        let error = timeout(Duration::from_secs(2), finish_job(&mut job))
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Przerwany"));
+        assert!(!error.contains("synthetic worker failure"));
+    }
 }

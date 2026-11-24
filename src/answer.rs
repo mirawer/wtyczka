@@ -74,6 +74,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn single_answer_requires_one_exact_digit_or_unknown() {
+        for n in 1..=9 {
+            assert_eq!(parse_answer(&format!(" {n}\n")).unwrap(), Answer::Choice(n));
+        }
+        assert_eq!(parse_answer("?").unwrap(), Answer::Unknown);
+        for bad in [
+            "",
+            "0",
+            "10",
+            "A",
+            "1 2",
+            "1\n2",
+            "Answer: 3",
+            "**4**",
+            "９",
+            "2.",
+            "1 or 2",
+        ] {
+            assert!(parse_answer(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn multiple_answers_are_sorted_and_separated_only_by_apostrophes() {
         assert_eq!(
             parse_multiple_answer(" 3'1'2\n").unwrap().values(),

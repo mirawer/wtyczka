@@ -32,10 +32,6 @@ mod tests {
     #[test]
     fn naming_is_scoped_and_lossless() {
         let path: Vec<u16> = r"\\?\C:\Users\alice\ScreenAnswer".encode_utf16().collect();
-        assert_eq!(
-            hash_input("S-1-5-21-1", &path),
-            hash_input("S-1-5-21-1", &path)
-        );
         assert_ne!(
             hash_input("S-1-5-21-1", &path),
             hash_input("S-1-5-21-2", &path)

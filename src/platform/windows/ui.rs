@@ -548,7 +548,7 @@ impl Native {
     fn cache_state(&mut self, state: State, foreground: Foreground) -> Result<()> {
         let cells = cell_states(state, self.mode, self.slots.len());
         // Prepare every handle first. A rendering failure leaves the previous cache intact.
-        let icons: Vec<_> = cells
+        let mut icons: Vec<_> = cells
             .into_iter()
             .enumerate()
             .map(|(index, state)| {
@@ -564,6 +564,9 @@ impl Native {
         if icons.len() != self.slots.len() {
             bail!("Shared display returned an incorrect Windows tray cell count");
         }
+        // Explorer places successive notification icons to the left of the
+        // existing one. Reverse rendered answers, not glyph prefix positions.
+        reverse_active_cells(&mut icons);
         for (slot, icon) in self.slots.iter_mut().zip(icons) {
             slot.dirty = icon.is_some();
             // Shell keeps its own copy of the last published icon, so superseded
@@ -821,6 +824,11 @@ fn tint_foreground(icon: &mut crate::display::Icon, foreground: Foreground) {
     }
 }
 
+fn reverse_active_cells<T>(cells: &mut [Option<T>]) {
+    let active = cells.iter().take_while(|cell| cell.is_some()).count();
+    cells[..active].reverse();
+}
+
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
@@ -832,6 +840,36 @@ fn win_error(operation: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_order_keeps_apostrophes_with_their_logical_answers() {
+        use crate::answer::{Answer, Choices};
+        for mode in [AnswerMode::Digits, AnswerMode::Dots] {
+            let state = State::Answer(Answer::Multiple(Choices::new(&[1, 3, 6]).unwrap()));
+            let mut icons: Vec<_> = cell_states(state, mode, 5)
+                .into_iter()
+                .enumerate()
+                .map(|(index, state)| state.map(|state| render_cell(state, mode, index > 0)))
+                .collect();
+            reverse_active_cells(&mut icons);
+            let expected: Vec<_> = [6, 3, 1]
+                .into_iter()
+                .enumerate()
+                .map(|(index, n)| {
+                    Some(render_cell(
+                        State::Answer(Answer::Choice(n)),
+                        mode,
+                        index < 2,
+                    ))
+                })
+                .chain([None, None])
+                .collect();
+            assert_eq!(icons, expected);
+        }
+        let mut idle = vec![Some(State::Idle), None, None];
+        reverse_active_cells(&mut idle);
+        assert_eq!(idle, [Some(State::Idle), None, None]);
+    }
 
     #[test]
     fn theme_tint_preserves_alpha_and_pixel_positions() {

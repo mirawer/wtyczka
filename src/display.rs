@@ -128,13 +128,9 @@ fn render(state: State, mode: AnswerMode) -> Icon {
 }
 
 fn add_apostrophe(icon: &mut Icon) {
-    for y in 0..32 {
-        for x in (4..32).rev() {
-            let src = (y * 32 + x - 4) * 4;
-            let dst = (y * 32 + x) * 4;
-            icon.data.copy_within(src..src + 4, dst);
-        }
-        icon.data[y * 32 * 4..(y * 32 + 4) * 4].fill(0);
+    for row in icon.data.chunks_exact_mut(32 * 4) {
+        row.copy_within(..28 * 4, 4 * 4);
+        row[..4 * 4].fill(0);
     }
     for y in 5..11 {
         for x in 3..=if y < 9 { 5 } else { 4 } {
